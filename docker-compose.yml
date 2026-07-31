@@ -11,7 +11,7 @@
 
 services:
   grok-register-agent:
-    image: ghcr.io/aini123152011/grok-register-agent:latest
+    image: aini123152008/grok-register-agent:latest
     container_name: grok-register-agent
     restart: unless-stopped
     ports:
@@ -49,7 +49,7 @@ services:
   # 可选：Turnstile Solver（默认不拉取/不启动）
   turnstile-solver:
     profiles: ["solver"]
-    image: ghcr.io/aini123152011/grok-turnstile-solver:latest
+    image: aini123152008/grok-turnstile-solver:latest
     container_name: grok-turnstile-solver
     restart: unless-stopped
     expose:
