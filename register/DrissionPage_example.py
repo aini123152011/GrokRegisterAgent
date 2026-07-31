@@ -1,0 +1,6680 @@
+# -*- coding: utf-8 -*-
+import sys
+import os
+import io
+
+# 强制 stdout/stderr 使用 UTF-8，解决 Windows 下 WebUI 读取乱码问题
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+
+# 管道接到 Node WebUI 时避免块缓冲吞掉早期诊断日志
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+from DrissionPage import Chromium, ChromiumOptions
+from DrissionPage.errors import PageDisconnectedError
+import argparse
+import shutil
+import tempfile
+import datetime
+import logging
+import time
+import secrets
+import platform
+from pathlib import Path
+
+from email_register import get_email_and_token, get_oai_code
+
+
+def setup_run_logger() -> logging.Logger:
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 加上 PID 避免多 worker 并发时同秒启动写到同一个日志文件
+    log_path = os.path.join(log_dir, f"run_{ts}_{os.getpid()}.log")
+
+    logger = logging.getLogger("grok_register")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    # 不挂 StreamHandler：WebUI 已捕获 stdout；再挂会导致每条日志打印两遍。
+    # 控制台可见输出统一走 print(..., flush=True) / _emit。
+
+    logger.info("日志文件: %s", log_path)
+    print(f"日志文件: {log_path}", flush=True)
+    return logger
+
+
+run_logger: logging.Logger = None
+
+
+
+def ensure_stable_python_runtime():
+    # 优先自动切到更稳定的 3.12 / 3.13，避免 3.14 下 Mail.tm 偶发 TLS/兼容问题。
+    if sys.version_info < (3, 14) or os.environ.get("DPE_REEXEC_DONE") == "1":
+        return
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    candidates = [
+        os.path.join(local_app_data, "Programs", "Python", "Python312", "python.exe"),
+        os.path.join(local_app_data, "Programs", "Python", "Python313", "python.exe"),
+    ]
+
+    current_python = os.path.normcase(os.path.abspath(sys.executable))
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        if os.path.normcase(os.path.abspath(candidate)) == current_python:
+            return
+
+        print(f"[*] 检测到 Python {sys.version.split()[0]}，自动切换到更稳定的解释器: {candidate}")
+        env = os.environ.copy()
+        env["DPE_REEXEC_DONE"] = "1"
+        os.execve(candidate, [candidate, os.path.abspath(__file__), *sys.argv[1:]], env)
+
+
+def warn_runtime_compatibility():
+    # 中文提示：避免把底层 TLS 兼容问题误判成脚本逻辑错误。
+    if sys.version_info >= (3, 14):
+        print("[提示] 当前 Python 为 3.14+；若出现 Mail.tm TLS 异常，建议改用 Python 3.12 或 3.13。")
+
+
+ensure_stable_python_runtime()
+warn_runtime_compatibility()
+
+# ------------------------------------------------------------
+# Linux 无 GUI 服务器：强制 Xvfb 有头模式（不要用 Chrome headless）
+# Turnstile 在 headless / 无 WebGL 环境下几乎必出 failure 反馈页。
+# ------------------------------------------------------------
+import shutil
+import glob as _glob_mod
+
+_virtual_display = None
+_IS_LINUX = platform.system() == "Linux"
+_WINDOW_W, _WINDOW_H = 1920, 1080
+
+
+def _display_is_usable(display: str) -> bool:
+    """粗检 DISPLAY 是否可用（Xvfb/真实 X 是否在听）。"""
+    if not display:
+        return False
+    # 允许 :99 或 localhost:99.0
+    name = display.split("/")[-1]
+    if name.startswith(":"):
+        try:
+            num = int(name[1:].split(".")[0])
+        except Exception:
+            return False
+        sock = f"/tmp/.X11-unix/X{num}"
+        return os.path.exists(sock)
+    return True
+
+
+def _ensure_virtual_display():
+    """
+    无 GUI Linux：确保有可用 DISPLAY。
+    - 已有可用 DISPLAY（如 docker entrypoint 起的 Xvfb）则复用
+    - 否则用 pyvirtualdisplay / 直接 Xvfb 拉起
+    """
+    global _virtual_display
+    if not _IS_LINUX:
+        return
+
+    force_xvfb = os.environ.get("USE_XVFB", "").strip() in ("1", "true", "yes")
+    current = (os.environ.get("DISPLAY") or "").strip()
+    if current and _display_is_usable(current) and not force_xvfb:
+        print(f"[*] 复用已有 DISPLAY={current}（无 GUI 服务器 / Xvfb）")
+        return
+
+    # 已设置但不可用：清掉后重建
+    if current and not _display_is_usable(current):
+        print(f"[Warn] DISPLAY={current} 不可用，将重新启动 Xvfb")
+        os.environ.pop("DISPLAY", None)
+
+    try:
+        from pyvirtualdisplay import Display
+        _virtual_display = Display(visible=0, size=(_WINDOW_W, _WINDOW_H), color_depth=24)
+        _virtual_display.start()
+        print(f"[*] Xvfb 虚拟显示器已启动: DISPLAY={os.environ.get('DISPLAY')} size={_WINDOW_W}x{_WINDOW_H}")
+        return
+    except Exception as e:
+        print(f"[Warn] pyvirtualdisplay 启动失败: {e}")
+
+    # 兜底：系统 Xvfb 命令
+    try:
+        import subprocess
+        disp = os.environ.get("XVFB_DISPLAY", ":99")
+        # 若占用则换号
+        for n in range(99, 120):
+            cand = f":{n}"
+            if not _display_is_usable(cand):
+                disp = cand
+                break
+        log_path = "/tmp/grok_xvfb.log"
+        subprocess.Popen(
+            ["Xvfb", disp, "-screen", "0", f"{_WINDOW_W}x{_WINDOW_H}x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+            stdout=open(log_path, "a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        time.sleep(0.6)
+        os.environ["DISPLAY"] = disp
+        if _display_is_usable(disp):
+            print(f"[*] 系统 Xvfb 已启动: DISPLAY={disp}（日志 {log_path}）")
+        else:
+            print(f"[Warn] Xvfb 已拉起但 socket 未就绪: DISPLAY={disp}")
+    except Exception as e:
+        print(f"[Warn] Xvfb 启动失败: {e}。无 DISPLAY 时 Chrome 可能无法过 Turnstile。")
+
+
+_ensure_virtual_display()
+
+# 从 config.json 读取代理 / 浏览器路径；代理支持池轮换（每轮 start_browser 再取）
+_browser_proxy = ""
+_browser_path_cfg = ""
+_resolved_browser_path = ""
+_current_fingerprint = None
+# addScriptToEvaluateOnNewDocument 是累加的：复用进程多轮注入会逐轮堆叠噪声层
+# （第 N 个号被 N 层 canvas 扰动）。记录已注入脚本 id，重注入前先移除，保持单层。
+_stealth_script_ids: list[str] = []
+_auto_auth_export = True
+_proxy_prefer_local_forward = False
+try:
+    import json as _json_mod
+    _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+    if os.path.isfile(_cfg_path):
+        with open(_cfg_path, "r") as _f:
+            _cfg = _json_mod.load(_f)
+        _browser_proxy = str(_cfg.get("browser_proxy", "") or _cfg.get("proxy", "") or "")
+        _browser_path_cfg = str(_cfg.get("browser_path", "") or "")
+        _auto_auth_export = bool(_cfg.get("auto_auth_export", True))
+        # 默认 True：带密码代理走本地转发，避免 set_proxy 静默直连
+        _proxy_prefer_local_forward = bool(
+            _cfg.get("proxy_prefer_local_forward", True)
+        )
+except Exception:
+    pass
+
+try:
+    from pools import (
+        next_proxy,
+        reload_pools,
+        peek_status,
+        acquire_proxy_for_register,
+        proxy_identity_key,
+    )
+except Exception:
+    def next_proxy(fallback: str = "") -> str:
+        return fallback
+
+    def reload_pools(force: bool = False) -> None:
+        return None
+
+    def peek_status() -> dict:
+        return {}
+
+    def acquire_proxy_for_register(fallback: str = "", *, log=print):
+        return (fallback or "").strip(), 0.0
+
+    def proxy_identity_key(proxy_url: str) -> str:
+        return (proxy_url or "").strip()
+
+try:
+    from proxy_auth_ext import apply_proxy_to_chromium_options, parse_proxy_url
+except Exception as _proxy_auth_import_err:
+    apply_proxy_to_chromium_options = None
+    parse_proxy_url = None
+    print(f"[Warn] proxy_auth_ext 导入失败（带密码代理将无法生效）: {_proxy_auth_import_err}")
+
+try:
+    from proxy_local_forward import stop_local_forward as _stop_local_forward_early
+except Exception:
+    _stop_local_forward_early = None
+
+# 启动自检：构建版本（Docker ENV / BUILD_ID 文件 / git short SHA）
+def _resolve_register_build() -> str:
+    """Prefer CI/image stamp, then BUILD_ID file, then local git short SHA."""
+    for key in (
+        "REGISTER_BUILD",
+        "GIT_COMMIT",
+        "GIT_SHA",
+        "SOURCE_COMMIT",
+        "GITHUB_SHA",
+    ):
+        v = (os.environ.get(key) or "").strip()
+        if not v:
+            continue
+        # full GITHUB_SHA → short
+        if len(v) >= 7 and all(c in "0123456789abcdefABCDEF" for c in v[:40]):
+            return v[:7]
+        return v[:32]
+    for cand in (
+        Path(__file__).resolve().parent / "BUILD_ID",
+        Path("/app/register/BUILD_ID"),
+        Path("/app/BUILD_ID"),
+    ):
+        try:
+            if cand.is_file():
+                line = cand.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+                if line:
+                    if len(line) >= 7 and all(
+                        c in "0123456789abcdefABCDEF" for c in line[:40]
+                    ):
+                        return line[:7]
+                    return line[:32]
+        except Exception:
+            pass
+    try:
+        import subprocess
+
+        root = Path(__file__).resolve().parent
+        for cwd in (root, root.parent, Path("/app")):
+            try:
+                r = subprocess.run(
+                    ["git", "-C", str(cwd), "rev-parse", "--short=7", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+                sha = (r.stdout or "").strip()
+                if r.returncode == 0 and sha:
+                    return sha
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "unknown"
+
+
+_REGISTER_BUILD = _resolve_register_build()
+print(f"[*] register build: {_REGISTER_BUILD}", flush=True)
+if apply_proxy_to_chromium_options is None:
+    print("[Warn] 缺少 proxy_auth_ext —— 请确认 ./register 已挂载并重启容器")
+else:
+    print("[*] proxy_auth_ext: OK（支持带密码 HTTP 代理：扩展/本地转发）")
+
+try:
+    from fingerprint import (
+        build_fingerprint,
+        apply_to_chromium_options,
+        stealth_js,
+        human_pause,
+    )
+except Exception:
+    build_fingerprint = None
+    apply_to_chromium_options = None
+    stealth_js = None
+    human_pause = None
+
+try:
+    from auth_service import sso_to_cpa_auth, default_auth_dir
+except Exception:
+    sso_to_cpa_auth = None
+    default_auth_dir = None
+
+# 解析浏览器路径（只做一次）
+if _browser_path_cfg and os.path.isfile(_browser_path_cfg):
+    _resolved_browser_path = _browser_path_cfg
+    print(f"[*] 浏览器路径: {_browser_path_cfg}")
+elif _IS_LINUX:
+    _linux_candidates = [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+    ]
+    _pw_chromes = sorted(
+        _glob_mod.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome")),
+        reverse=True,
+    )
+    for _candidate in _linux_candidates + _pw_chromes:
+        if _candidate and os.path.isfile(_candidate) and os.access(_candidate, os.X_OK):
+            _resolved_browser_path = _candidate
+            break
+    if _resolved_browser_path:
+        print(f"[*] Linux 浏览器: {_resolved_browser_path}")
+    else:
+        print("[Warn] 未找到 chrome/chromium，将使用 DrissionPage 默认路径")
+
+EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
+if os.path.isdir(EXTENSION_PATH):
+    print(f"[*] 已加载 Turnstile 扩展: {EXTENSION_PATH}")
+else:
+    print(f"[Warn] Turnstile 扩展目录不存在: {EXTENSION_PATH}")
+
+
+def _new_chromium_options() -> ChromiumOptions:
+    """每轮新建 ChromiumOptions，避免代理扩展/指纹在全局 co 上累积。"""
+    opts = ChromiumOptions()
+    opts.auto_port()
+    try:
+        opts.headless(False)
+    except Exception:
+        pass
+    # Windows 手动 Chrome 不用 --no-sandbox（常见自动化画像）
+    if _IS_LINUX:
+        opts.set_argument("--no-sandbox")
+        opts.set_argument("--disable-dev-shm-usage")
+    opts.set_argument(f"--window-size={_WINDOW_W},{_WINDOW_H}")
+    opts.set_argument("--window-position=0,0")
+    opts.set_argument("--disable-blink-features=AutomationControlled")
+    # 不再硬编码 --lang=en-US：与随机指纹的 --lang 冲突会导致 HTTP Accept-Language
+    # 与 navigator.languages 不一致（bot 信号）。语言统一交 fingerprint.apply_to_chromium_options。
+    # 封堵 WebRTC 真实 IP 泄漏：HTTP 走代理但 WebRTC STUN 仍会暴露宿主真实公网 IP，
+    # 让代理形同虚设。disable_non_proxied_udp 强制 UDP 只走代理路径。
+    opts.set_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+    try:
+        opts.set_argument("--no-first-run")
+        opts.set_argument("--no-default-browser-check")
+        opts.set_argument("--disable-infobars")
+    except Exception:
+        pass
+    if _IS_LINUX:
+        opts.set_argument("--disable-gpu-compositing")
+        opts.set_argument("--use-gl=angle")
+        opts.set_argument("--use-angle=swiftshader-webgl")
+        # Chrome 137+ 默认禁用 SwiftShader 软件 WebGL：无独显机器上 --use-angle=swiftshader
+        # 已不足以启用，必须显式解禁，否则 canvas.getContext('webgl') 返回 null/降级上下文，
+        # Turnstile 取不到有效 WebGL 指纹 → widget 折叠 1x1 拒绝渲染。镜像 chromium 未锁版本
+        # （Dockerfile apt install chromium），bookworm 现版早已 ≥137，故此参数为必需。
+        opts.set_argument("--enable-unsafe-swiftshader")
+        opts.set_argument("--enable-webgl")
+        opts.set_argument("--ignore-gpu-blocklist")
+        opts.set_argument("--enable-features=NetworkService,NetworkServiceInProcess")
+        opts.set_argument("--mute-audio")
+        opts.set_argument("--disable-background-networking")
+        opts.set_argument("--no-first-run")
+        opts.set_argument("--no-default-browser-check")
+    try:
+        opts.set_pref("credentials_enable_service", False)
+        opts.set_pref("profile.password_manager_enabled", False)
+    except Exception:
+        pass
+    try:
+        opts.set_timeouts(base=1)
+    except Exception:
+        pass
+    if _resolved_browser_path and os.path.isfile(_resolved_browser_path):
+        opts.set_browser_path(_resolved_browser_path)
+    if os.path.isdir(EXTENSION_PATH):
+        opts.add_extension(EXTENSION_PATH)
+    return opts
+
+
+# 兼容旧代码中对全局 co 的引用（探测版本等）
+co = _new_chromium_options()
+
+_MACHINE = platform.machine() or ""
+_ARCH_NOTE = ""
+if _MACHINE.lower() in ("aarch64", "arm64", "armv8l", "armv7l"):
+    _ARCH_NOTE = "（ARM：Turnstile 指纹/WebGL 通过率通常低于 x86_64）"
+elif _MACHINE.lower() in ("x86_64", "amd64"):
+    _ARCH_NOTE = "（x86_64）"
+
+print(
+    f"[*] 运行环境: system={platform.system()} machine={_MACHINE}{_ARCH_NOTE} "
+    f"python={platform.python_version()} DISPLAY={os.environ.get('DISPLAY', '')!r} "
+    f"window={_WINDOW_W}x{_WINDOW_H} headless=False",
+    flush=True,
+)
+
+_chrome_temp_dir: str = ""
+browser = None
+page = None
+# 指纹探测是否已输出（必须模块级初始化，否则 NameError）
+_fingerprint_logged = False
+
+SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+
+_sso_dir = os.path.join(os.path.dirname(__file__), "sso")
+_sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}_{os.getpid()}.txt")
+
+
+def _apply_stealth_patches(tab=None):
+    """弱化常见自动化指纹（有限规避；无法抹掉已签发 bot_flag_source=1）。
+
+    优先注入本轮 fingerprint.stealth_js；再叠基础 webdriver/chrome 补丁。
+    """
+    target = tab or page
+    if target is None:
+        return
+    # 本轮随机特征：新文档 + 当前页双注入
+    fp_src = None
+    try:
+        if _current_fingerprint is not None and stealth_js is not None:
+            fp_src = stealth_js(_current_fingerprint)
+    except Exception:
+        fp_src = None
+    base_src = r"""
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+try {
+  if (!window.chrome) window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+  else if (!window.chrome.runtime) window.chrome.runtime = {};
+} catch (e) {}
+try {
+  const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+  if (originalQuery) {
+    window.navigator.permissions.query = (parameters) => (
+      parameters && parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery.call(window.navigator.permissions, parameters)
+    );
+  }
+} catch (e) {}
+"""
+    # addScriptToEvaluateOnNewDocument 是累加的：复用进程反复注入会让噪声脚本
+    # 逐轮堆叠（第 N 号被 N 层 canvas 扰动）。重注入前先移除本模块上一轮登记的
+    # 脚本 id，保证每号只有一份当前指纹的 stealth/noise。
+    global _stealth_script_ids
+    for _old_id in list(_stealth_script_ids):
+        try:
+            target.run_cdp("Page.removeScriptToEvaluateOnNewDocument", identifier=_old_id)
+        except Exception:
+            pass
+    _stealth_script_ids = []
+    for src in (base_src, fp_src):
+        if not src:
+            continue
+        try:
+            _ret = target.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=src)
+            _sid = (_ret or {}).get("identifier") if isinstance(_ret, dict) else None
+            if _sid:
+                _stealth_script_ids.append(_sid)
+        except Exception:
+            pass
+        try:
+            target.run_js(src)
+        except Exception:
+            pass
+    # 时区：用 CDP Emulation.setTimezoneOverride 覆盖整个 V8 时区栈。
+    # 仅 JS patch Intl.resolvedOptions() 会导致 getTimezoneOffset() 仍是宿主时区，
+    # 两者不一致是强 bot 信号；CDP override 让 Date/Intl 全部一致。
+    try:
+        tz = getattr(_current_fingerprint, "timezone", None)
+        if tz:
+            target.run_cdp("Emulation.setTimezoneOverride", timezoneId=tz)
+    except Exception:
+        # 个别 Chromium 对未知时区 id 会抛错：忽略，退回 JS patch
+        pass
+
+
+def _regen_fingerprint_for_reuse(tab=None):
+    """复用进程（不重启浏览器）时重新生成并注入指纹。
+
+    背景：默认 browser_recycle_every=5，复用分支只清 cookie 不换指纹，导致
+    中间 4 个号共用同一份 canvas/audio/时区/语言指纹——同批号被风控聚成一簇、
+    风险随号数单调抬升。这里在复用时也刷新 _current_fingerprint（关键是每号
+    独立的 noise_seed → canvas/audio 哈希逐号不同），并经 _apply_stealth_patches
+    重注入（该函数会先移除上一轮 addScriptToEvaluateOnNewDocument 脚本，避免堆叠）。
+
+    窗口尺寸经 --window-size 在启动时固定，复用中改不了（弱字段，忽略）；canvas/
+    audio/时区/语言/UA 属性均为 JS/CDP 注入，可热刷新。
+    """
+    global _current_fingerprint
+    if build_fingerprint is None:
+        return
+    target = tab or page
+    if target is None:
+        return
+    try:
+        major = _real_chrome_major()
+    except Exception:
+        major = None
+    try:
+        geo_cc = _detect_exit_country(_browser_proxy)
+    except Exception:
+        geo_cc = None
+    try:
+        _current_fingerprint = build_fingerprint(chrome_major=major, geo_country=geo_cc)
+    except Exception as e:
+        print(f"[Warn] 复用指纹生成失败: {e}", flush=True)
+        return
+    try:
+        _apply_stealth_patches(target)
+    except Exception as e:
+        print(f"[Warn] 复用指纹注入失败: {e}", flush=True)
+        return
+    try:
+        print(
+            f"[*] 复用刷新特征: tz={_current_fingerprint.timezone} "
+            f"lang={_current_fingerprint.locale} "
+            f"noise={_current_fingerprint.noise_seed & 0xffff:04x}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _resolve_browser_binary_path() -> str:
+    """解析当前/常见 Chromium 可执行路径。"""
+    path = ""
+    try:
+        path = str(getattr(co, "browser_path", "") or "")
+    except Exception:
+        path = ""
+    if not path:
+        for attr in ("_browser_path", "browser_path"):
+            try:
+                path = str(getattr(co, attr, "") or "")
+            except Exception:
+                continue
+            if path:
+                break
+    if path and os.path.isfile(path):
+        return path
+    for cand in (
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    ):
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def _real_chrome_major() -> int | None:
+    """
+    读取本机 Chromium 大版本号，供 UA 对齐（避免 150 二进制 + 137 UA）。
+    失败返回 None，由 build_fingerprint 走默认版本表。
+    Windows 上 chrome.exe --version 常超时：改扫 Application 版本目录 / 文件属性。
+    """
+    import re
+    import subprocess
+
+    path = _resolve_browser_binary_path()
+    ver_text = ""
+    if path:
+        try:
+            out = subprocess.check_output(
+                [path, "--version"], stderr=subprocess.STDOUT, timeout=3
+            )
+            ver_text = out.decode("utf-8", "replace").strip()
+        except Exception:
+            ver_text = ""
+    if not ver_text:
+        ver_text = str(
+            os.environ.get("CHROME_VERSION") or os.environ.get("CHROMIUM_VERSION") or ""
+        )
+    # Windows: Application\144.0.x.x\ 目录名
+    if path:
+        try:
+            app_dir = os.path.dirname(path)
+            best = 0
+            for name in os.listdir(app_dir):
+                mdir = re.match(r"^(\d{2,3})\.\d+", name)
+                if mdir:
+                    best = max(best, int(mdir.group(1)))
+            if 80 <= best <= 200 and not ver_text:
+                return best
+            if 80 <= best <= 200 and ver_text:
+                # prefer folder major if --version missing digits
+                pass
+            if 80 <= best <= 200 and not re.search(r"\d{2,3}\.\d+", ver_text or ""):
+                return best
+        except Exception:
+            pass
+        if not ver_text:
+            try:
+                ps = (
+                    "(Get-Item -LiteralPath '"
+                    + path.replace("'", "''")
+                    + "').VersionInfo.ProductVersion"
+                )
+                out = subprocess.check_output(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                )
+                ver_text = out.decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            # folder scan again as last resort
+            try:
+                app_dir = os.path.dirname(path)
+                best = 0
+                for name in os.listdir(app_dir):
+                    mdir = re.match(r"^(\d{2,3})\.\d+", name)
+                    if mdir:
+                        best = max(best, int(mdir.group(1)))
+                if 80 <= best <= 200:
+                    return best
+            except Exception:
+                pass
+    m = re.search(r"(?:Chromium|Chrome)[\s/]+(\d{2,3})\.", ver_text, re.I)
+    if not m:
+        m = re.search(r"\b(\d{2,3})\.\d+\.\d+", ver_text)
+    if not m:
+        return None
+    try:
+        major = int(m.group(1))
+    except Exception:
+        return None
+    if 80 <= major <= 200:
+        return major
+    return None
+
+
+_geo_country_cache: dict[str, str] = {}
+
+
+def _detect_exit_country(proxy: str) -> str | None:
+    """探测代理出口国家（ISO alpha-2），供指纹时区/语言对齐。
+
+    - 走与浏览器同一代理，读 Cloudflare trace（cdn-cgi/trace 返回 loc=XX）。
+    - 仅支持 http/https 代理（urllib ProxyHandler）；socks / 本机转发跳过。
+    - 任何失败返回 None → 指纹回退全局随机池（旧行为），不阻断注册。
+    - 结果按 IP 键缓存，避免每轮重复查询。
+    """
+    import urllib.request
+
+    p = str(proxy or "").strip()
+    cache_key = ""
+    try:
+        cache_key = proxy_identity_key(p) if (p and callable(proxy_identity_key)) else p
+    except Exception:
+        cache_key = p
+    if cache_key and cache_key in _geo_country_cache:
+        return _geo_country_cache[cache_key] or None
+
+    scheme = ""
+    try:
+        if p and parse_proxy_url:
+            info = parse_proxy_url(p)
+            scheme = str((info or {}).get("scheme") or "").lower()
+    except Exception:
+        scheme = ""
+    # socks 系 urllib 不原生支持；直连(空 proxy)也照常查本机出口
+    if scheme.startswith("socks"):
+        if cache_key:
+            _geo_country_cache[cache_key] = ""
+        return None
+
+    country = None
+    try:
+        handlers = []
+        if p:
+            handlers.append(urllib.request.ProxyHandler({"http": p, "https": p}))
+        opener = urllib.request.build_opener(*handlers)
+        req = urllib.request.Request(
+            "https://www.cloudflare.com/cdn-cgi/trace",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with opener.open(req, timeout=8) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        for line in body.splitlines():
+            if line.startswith("loc="):
+                loc = line[4:].strip().upper()
+                if len(loc) == 2 and loc.isalpha():
+                    country = loc
+                break
+    except Exception:
+        country = None
+
+    if cache_key:
+        _geo_country_cache[cache_key] = country or ""
+    return country
+
+
+def _probe_browser_version() -> str:
+    """读取已配置/正在使用的 chrome 路径版本号。"""
+    path = _resolve_browser_binary_path()
+    if not path:
+        return "unknown"
+    try:
+        import subprocess
+        out = subprocess.check_output([path, "--version"], stderr=subprocess.STDOUT, timeout=8)
+        return f"{path} | {out.decode('utf-8', 'replace').strip()}"
+    except Exception as e:
+        return f"{path} | version-fail:{e}"
+
+
+def _probe_webgl_and_ua(tab) -> dict:
+    """在浏览器内探测 UA / 平台 / WebGL，用于判断 ARM 无 GUI 指纹是否残缺。"""
+    try:
+        return tab.run_js(
+            r"""
+const nav = {
+  userAgent: navigator.userAgent || '',
+  platform: navigator.platform || '',
+  webdriver: navigator.webdriver,
+  languages: navigator.languages || [],
+  hardwareConcurrency: navigator.hardwareConcurrency || 0,
+  deviceMemory: navigator.deviceMemory || null,
+  maxTouchPoints: navigator.maxTouchPoints || 0,
+};
+let webgl = { ok: false };
+try {
+  const canvas = document.createElement('canvas');
+  const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+  if (!gl) {
+    webgl = { ok: false, error: 'no-webgl-context' };
+  } else {
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    webgl = {
+      ok: true,
+      vendor: gl.getParameter(gl.VENDOR) || '',
+      renderer: gl.getParameter(gl.RENDERER) || '',
+      unmaskedVendor: dbg ? (gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '') : '',
+      unmaskedRenderer: dbg ? (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '') : '',
+      version: gl.getParameter(gl.VERSION) || '',
+    };
+  }
+} catch (e) {
+  webgl = { ok: false, error: String(e) };
+}
+return {
+  nav,
+  webgl,
+  screen: {
+    width: screen.width,
+    height: screen.height,
+    availWidth: screen.availWidth,
+    availHeight: screen.availHeight,
+    colorDepth: screen.colorDepth,
+    devicePixelRatio: window.devicePixelRatio || 1,
+  },
+  displayEnv: '',
+};
+            """
+        ) or {}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _emit(msg: str) -> None:
+    """同时打到 stdout（WebUI）和 run_logger（文件），并立刻 flush。"""
+    print(msg, flush=True)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    if run_logger is not None:
+        try:
+            run_logger.info("%s", msg)
+        except Exception:
+            pass
+
+
+def log_runtime_fingerprint(tab=None, force: bool = False):
+    """
+    打印架构 / 浏览器版本 / WebGL 探测，方便确认 ARM 无 GUI 环境是否可用。
+    默认每个进程只详打一次，避免每轮刷屏。
+    """
+    global _fingerprint_logged
+    # 防御：热更新/旧进程合并时变量可能缺失
+    try:
+        already = _fingerprint_logged
+    except NameError:
+        already = False
+        globals()["_fingerprint_logged"] = False
+    if already and not force:
+        return
+    target = tab or page
+    machine = platform.machine() or "?"
+    arch_hint = ""
+    if machine.lower() in ("aarch64", "arm64", "armv8l", "armv7l"):
+        arch_hint = "ARM 风险：Turnstile 更容易给 failure，优先考虑 x86_64 worker"
+    elif machine.lower() in ("x86_64", "amd64"):
+        arch_hint = "x86_64 相对更友好"
+    _emit(f"[*] 指纹探测 machine={machine} | {arch_hint}")
+    _emit(f"[*] 浏览器版本: {_probe_browser_version()}")
+    _emit(
+        f"[*] DISPLAY={os.environ.get('DISPLAY', '')!r} "
+        f"XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE', '')!r} "
+        f"WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', '')!r}"
+    )
+    if target is None:
+        _emit("[Warn] 浏览器未就绪，跳过 WebGL/UA 探测")
+        return
+    info = _probe_webgl_and_ua(target)
+    if info.get("error"):
+        _emit(f"[Warn] WebGL/UA 探测失败: {info['error']}")
+        _fingerprint_logged = True
+        return
+    nav = info.get("nav") or {}
+    webgl = info.get("webgl") or {}
+    scr = info.get("screen") or {}
+    _emit(f"[*] UA: {nav.get('userAgent', '')}")
+    _emit(
+        f"[*] platform={nav.get('platform')!r} webdriver={nav.get('webdriver')!r} "
+        f"hw={nav.get('hardwareConcurrency')} mem={nav.get('deviceMemory')} "
+        f"langs={nav.get('languages')}"
+    )
+    _emit(
+        f"[*] screen={scr.get('width')}x{scr.get('height')} "
+        f"avail={scr.get('availWidth')}x{scr.get('availHeight')} "
+        f"depth={scr.get('colorDepth')} dpr={scr.get('devicePixelRatio')}"
+    )
+    if webgl.get("ok"):
+        _emit(
+            f"[*] WebGL OK vendor={webgl.get('vendor')!r} renderer={webgl.get('renderer')!r}"
+        )
+        _emit(
+            f"[*] WebGL unmasked vendor={webgl.get('unmaskedVendor')!r} "
+            f"renderer={webgl.get('unmaskedRenderer')!r} version={webgl.get('version')!r}"
+        )
+        renderer_l = str(webgl.get("unmaskedRenderer") or webgl.get("renderer") or "").lower()
+        if any(x in renderer_l for x in ("swiftshader", "llvmpipe", "softpipe", "software")):
+            _emit("[Warn] WebGL 为软件渲染（SwiftShader/llvmpipe）——无独显服务器常见，Turnstile 分可能偏低")
+        if machine.lower() in ("aarch64", "arm64") and "swiftshader" in renderer_l:
+            _emit("[Warn] ARM + 软件 WebGL：建议换 x86_64 跑注册机，或使用住宅代理降低 failure")
+    else:
+        _emit(f"[Warn] WebGL 不可用: {webgl} —— Turnstile 极易 failure，请检查 Xvfb/Chromium/GL 库")
+    _fingerprint_logged = True
+
+
+def _start_browser_once():
+    """单次拉起浏览器 + 应用一个代理（不再做出口 IP 探测）。
+
+    返回 dict: browser, page, exit_ip_ok, exit_ip_err, proxy, used_proxy
+    （exit_ip_* 固定为成功/空，兼容旧调用方）
+    """
+    # 每轮从全新浏览器开始，使用独立临时 profile 目录避免 Cookie/Session 复用。
+    # 注意：带 user:pass 的代理必须用扩展注入，co.set_proxy 会静默忽略（DrissionPage 限制）。
+    global browser, page, _chrome_temp_dir, _current_fingerprint, _browser_proxy, co
+    if _IS_LINUX:
+        _ensure_virtual_display()
+
+    # 每轮新 ChromiumOptions，避免认证扩展/指纹在全局对象上累积
+    co = _new_chromium_options()
+    proxy_apply_result = None
+
+    # 代理池：每轮取一个（先创建 profile 目录，auth 扩展写在其下）
+    _chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
+    try:
+        reload_pools(force=True)
+    except Exception:
+        pass
+    try:
+        st = peek_status() if callable(peek_status) else {}
+        pool_n = len(st.get("proxies") or []) if isinstance(st, dict) else 0
+        if pool_n:
+            print(
+                f"[*] 代理池: {pool_n} 条 mode={st.get('proxy_mode') or '?'} "
+                f"next_idx={st.get('proxy_idx', '?')}"
+            )
+        else:
+            # 池空：打印 config 关键键，便于排查「UI 有代理却直连」
+            try:
+                import json as _jdbg
+                _cp = os.path.join(os.path.dirname(__file__), "config.json")
+                if os.path.isfile(_cp):
+                    with open(_cp, "r", encoding="utf-8") as _fdbg:
+                        _cd = _jdbg.load(_fdbg)
+                    _pp = _cd.get("proxy_pool") or _cd.get("proxies")
+                    _n = len(_pp) if isinstance(_pp, list) else (1 if _pp else 0)
+                    print(
+                        f"[Warn] 代理池为空 | config.proxy_pool条目={_n} "
+                        f"proxy={bool(str(_cd.get('proxy') or '').strip())} "
+                        f"browser_proxy={bool(str(_cd.get('browser_proxy') or '').strip())} "
+                        f"proxyEnabled未写入Python(仅看proxy_pool/proxy字段)"
+                    )
+                else:
+                    print("[Warn] 代理池为空且无 config.json")
+            except Exception as _e:
+                print(f"[Warn] 代理池为空（读 config 失败: {_e}）")
+    except Exception:
+        pass
+
+    proxy_apply_result = None
+    try:
+        # 池优先；池空则 acquire 返回 fallback（browser_proxy/proxy）
+        # 同一 IP 未到使用间隔时会 sleep 等待（暂停队列）
+        picked, waited_ip = acquire_proxy_for_register(_browser_proxy, log=print)
+        picked = (picked or "").strip()
+        if waited_ip and waited_ip > 0.05:
+            print(f"[*] IP 间隔累计等待 {waited_ip:.1f}s 后继续")
+        if picked:
+            _browser_proxy = picked
+            # 脱敏日志
+            log_proxy = picked
+            try:
+                if parse_proxy_url:
+                    p = parse_proxy_url(picked)
+                    if p and p.get("has_auth"):
+                        log_proxy = (
+                            f"{p['scheme']}://{p['username'][:8]}…:***@{p['host']}:{p['port']}"
+                        )
+            except Exception:
+                pass
+            try:
+                ik = proxy_identity_key(picked) if callable(proxy_identity_key) else ""
+                if ik:
+                    print(f"[*] 本轮代理 IP 键: {ik}")
+            except Exception:
+                pass
+            # CF 独立代理：探测本地端口是否在听，避免「pid 在跑但端口未就绪」
+            try:
+                from pools import is_cf_proxy_mode, is_local_loopback_proxy
+
+                if is_cf_proxy_mode() or is_local_loopback_proxy(picked):
+                    import socket as _sock
+
+                    _host, _port = "127.0.0.1", 30000
+                    try:
+                        if parse_proxy_url:
+                            _pp = parse_proxy_url(picked)
+                            if _pp:
+                                _host = str(_pp.get("host") or "127.0.0.1")
+                                _port = int(_pp.get("port") or 30000)
+                    except Exception:
+                        pass
+                    _ok = False
+                    try:
+                        with _sock.create_connection((_host, _port), timeout=1.5):
+                            _ok = True
+                    except Exception as _pe:
+                        print(
+                            f"[Warn] CF/本机代理端口不可达 {_host}:{_port}: {_pe} "
+                            f"（请确认 cfwp 运行中，且 client_ip=:{_port}）",
+                            flush=True,
+                        )
+                    if _ok:
+                        print(
+                            f"[*] CF/本机代理端口就绪 {_host}:{_port} · {log_proxy}",
+                            flush=True,
+                        )
+            except Exception:
+                pass
+
+            if apply_proxy_to_chromium_options is not None:
+                # 热读 prefer local forward
+                prefer_local = _proxy_prefer_local_forward
+                try:
+                    import json as _jm
+                    _cp = os.path.join(os.path.dirname(__file__), "config.json")
+                    if os.path.isfile(_cp):
+                        with open(_cp, "r", encoding="utf-8") as _cf:
+                            prefer_local = bool(
+                                _jm.load(_cf).get("proxy_prefer_local_forward", prefer_local)
+                            )
+                except Exception:
+                    pass
+                proxy_apply_result = apply_proxy_to_chromium_options(
+                    co,
+                    picked,
+                    work_dir=_chrome_temp_dir,
+                    prefer_local_forward=prefer_local,
+                )
+                mode = proxy_apply_result.get("mode")
+                if mode == "auth_extension":
+                    print(
+                        f"[proxy] 浏览器代理(本轮/认证扩展): "
+                        f"{proxy_apply_result.get('proxy') or log_proxy}",
+                        flush=True,
+                    )
+                elif mode == "local_forward":
+                    print(
+                        f"[proxy] 浏览器代理(本轮/本地转发): "
+                        f"{proxy_apply_result.get('local_proxy')} "
+                        f"→ {proxy_apply_result.get('proxy') or log_proxy}",
+                        flush=True,
+                    )
+                elif mode in ("set_proxy", "arg"):
+                    print(
+                        f"[proxy] 浏览器代理(本轮/{mode}): "
+                        f"{proxy_apply_result.get('proxy') or log_proxy}",
+                        flush=True,
+                    )
+                elif mode == "error":
+                    # 已启用代理却无法注入 → 禁止静默直连（否则看起来「没连上代理」）
+                    err = proxy_apply_result.get("error")
+                    print(
+                        f"[proxy][!] 代理配置失败，本轮中止（不直连）: {err} | raw={log_proxy}",
+                        flush=True,
+                    )
+                    raise RuntimeError(f"proxy apply failed: {err}")
+                else:
+                    print(f"[proxy] 浏览器代理(本轮): {log_proxy}", flush=True)
+            else:
+                # 无 proxy_auth_ext：绝不能 set_proxy(user:pass)，会静默直连
+                try:
+                    from proxy_local_forward import start_local_forward
+
+                    fr = start_local_forward(picked)
+                    if fr.get("ok"):
+                        try:
+                            co.set_proxy(fr["local_proxy"])
+                        except Exception:
+                            co.set_argument("--proxy-server", fr["local_proxy"])
+                        print(
+                            f"[proxy] 浏览器代理(本轮/本地转发-noext): "
+                            f"{fr.get('local_proxy')} → {log_proxy}",
+                            flush=True,
+                        )
+                        proxy_apply_result = {
+                            "mode": "local_forward",
+                            "local_proxy": fr.get("local_proxy"),
+                            "proxy": log_proxy,
+                        }
+                    else:
+                        print(
+                            f"[proxy][!] 无 proxy_auth_ext 且本地转发失败，本轮中止（不直连）: "
+                            f"{fr.get('error')}",
+                            flush=True,
+                        )
+                        raise RuntimeError(
+                            f"proxy local forward failed: {fr.get('error')}"
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    print(
+                        f"[proxy][!] 带密码代理无法配置（缺模块）: {e} — "
+                        f"请同步 register/ 并重启容器",
+                        flush=True,
+                    )
+                    raise RuntimeError(f"proxy module missing: {e}") from e
+        else:
+            # picked 为空：若总开关开着，说明池/单条都没配上
+            try:
+                import json as _j_pe
+                _cfg_pe = {}
+                try:
+                    with open(
+                        os.path.join(os.path.dirname(__file__), "config.json"),
+                        "r",
+                        encoding="utf-8",
+                    ) as _fp:
+                        _cfg_pe = _j_pe.load(_fp) or {}
+                except Exception:
+                    _cfg_pe = {}
+                def _on(v, default=False):
+                    if isinstance(v, bool):
+                        return v
+                    if v is None:
+                        return default
+                    s = str(v).strip().lower()
+                    return s in ("1", "true", "yes", "on", "enabled") if s else default
+                _cf_on = _on(_cfg_pe.get("cf_proxy_enabled"), False)
+                _pe_on = _cf_on or _on(_cfg_pe.get("proxy_enabled"), False)
+                if _pe_on and not _cf_on:
+                    print(
+                        "[proxy][!] 已启用代理但 acquire 未拿到节点 → 本轮中止（不直连）",
+                        flush=True,
+                    )
+                    raise RuntimeError("proxy enabled but no proxy acquired")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+            print("[proxy] 浏览器代理: 直接连接（proxy_enabled=false 或无节点）", flush=True)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(f"[proxy][!] 代理池选取失败: {e}", flush=True)
+        try:
+            import json as _j_pe2
+            _cfg_pe2 = {}
+            try:
+                with open(
+                    os.path.join(os.path.dirname(__file__), "config.json"),
+                    "r",
+                    encoding="utf-8",
+                ) as _fp2:
+                    _cfg_pe2 = _j_pe2.load(_fp2) or {}
+            except Exception:
+                _cfg_pe2 = {}
+            def _on2(v, default=False):
+                if isinstance(v, bool):
+                    return v
+                if v is None:
+                    return default
+                s = str(v).strip().lower()
+                return s in ("1", "true", "yes", "on", "enabled") if s else default
+            _pe_on2 = _on2(_cfg_pe2.get("cf_proxy_enabled"), False) or _on2(
+                _cfg_pe2.get("proxy_enabled"), False
+            )
+            if _pe_on2:
+                raise RuntimeError(f"proxy acquire failed: {e}") from e
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+    # 随机注册特征（UA 大版本对齐真实 Chromium，降低 Turnstile 版本错配）
+    if build_fingerprint is not None:
+        try:
+            major = _real_chrome_major()
+            # 出口国家 → 时区/语言对齐，消除 IP↔时区↔语言错配画像。
+            # 经本轮代理查询；失败/直连则 None，指纹回退全局随机池。
+            geo_cc = _detect_exit_country(_browser_proxy)
+            _current_fingerprint = build_fingerprint(
+                chrome_major=major, geo_country=geo_cc
+            )
+            if apply_to_chromium_options is not None:
+                apply_to_chromium_options(co, _current_fingerprint)
+            ua_note = f" chrome_major={major}" if major else ""
+            geo_note = f" geo={geo_cc}" if geo_cc else " geo=?(随机池)"
+            print(
+                f"[*] 本轮特征: ua={_current_fingerprint.user_agent[:60]}… "
+                f"tz={_current_fingerprint.timezone} "
+                f"lang={_current_fingerprint.locale} "
+                f"size={_current_fingerprint.window_w}x{_current_fingerprint.window_h}"
+                f"{ua_note}{geo_note}"
+            )
+        except Exception as e:
+            print(f"[Warn] 指纹生成失败: {e}")
+            _current_fingerprint = None
+
+    co.set_user_data_path(_chrome_temp_dir)
+    # DrissionPage: set_user_data_path 会清掉 auto_port/address，启动前必须再设端口
+    try:
+        if not str(getattr(co, "address", "") or "").strip():
+            co.auto_port()
+    except Exception:
+        try:
+            co.set_local_port(0)
+        except Exception:
+            pass
+    browser = Chromium(co)
+    tabs = browser.get_tabs()
+    page = tabs[-1] if tabs else browser.new_tab()
+    win_w = getattr(_current_fingerprint, "window_w", None) or _WINDOW_W
+    win_h = getattr(_current_fingerprint, "window_h", None) or _WINDOW_H
+    try:
+        page.set.window.size(win_w, win_h)
+    except Exception:
+        try:
+            page.run_cdp("Browser.setWindowBounds", windowId=1, bounds={
+                "left": 0, "top": 0, "width": win_w, "height": win_h, "windowState": "normal"
+            })
+        except Exception:
+            pass
+    _apply_stealth_patches(page)
+    # 叠加本轮随机特征 JS
+    if _current_fingerprint is not None and stealth_js is not None:
+        try:
+            page.run_js(stealth_js(_current_fingerprint))
+        except Exception:
+            pass
+
+    # 已移除出口 IP 探测（api.ipify / CF trace 等），启动后直接进入注册流程
+    # 进程内首次启动时打印架构/版本/WebGL，确认 ARM 无 GUI 环境
+    log_runtime_fingerprint(page, force=False)
+    return {
+        "browser": browser,
+        "page": page,
+        "exit_ip_ok": True,
+        "exit_ip_err": "",
+        "proxy": _browser_proxy or "",
+        "used_proxy": bool(str(_browser_proxy or "").strip()),
+    }
+
+
+def _format_proxy_for_log(proxy: str) -> str:
+    """日志用：脱敏 user:pass，保留 scheme/host:port。"""
+    p = str(proxy or "").strip()
+    if not p:
+        return "(直连)"
+    try:
+        if parse_proxy_url:
+            info = parse_proxy_url(p)
+            if info and info.get("has_auth"):
+                u = str(info.get("username") or "")[:8]
+                return (
+                    f"{info.get('scheme') or 'http'}://{u}…:***"
+                    f"@{info.get('host')}:{info.get('port')}"
+                )
+            if info:
+                return (
+                    f"{info.get('scheme') or 'http'}://"
+                    f"{info.get('host')}:{info.get('port')}"
+                )
+    except Exception:
+        pass
+    # 兜底脱敏
+    if "@" in p and "://" in p:
+        try:
+            scheme, rest = p.split("://", 1)
+            cred, host = rest.rsplit("@", 1)
+            user = cred.split(":")[0][:8]
+            return f"{scheme}://{user}…:***@{host}"
+        except Exception:
+            pass
+    return p[:96]
+
+
+def start_browser(*, max_proxy_tries: int | None = None):
+    """拉起浏览器（已取消出口 IP 检测与因此触发的换代理重试）。
+
+    仅打印当前使用的代理信息，不做出口探测。
+    max_proxy_tries 保留兼容旧调用，忽略。
+    代理已启用却注入失败时抛 RuntimeError（禁止静默直连）。
+    """
+    _ = max_proxy_tries
+    info = _start_browser_once()
+    if isinstance(info, tuple):
+        return info
+    used = str(info.get("proxy") or _browser_proxy or "").strip()
+    if info.get("used_proxy") and used:
+        print(f"[proxy] 当前使用代理: {_format_proxy_for_log(used)}", flush=True)
+    else:
+        print("[proxy] 当前使用代理: (直连)", flush=True)
+    return info["browser"], info["page"]
+
+
+def stop_browser():
+    # 完整关闭整个浏览器实例，并清理本轮临时 profile，供下一轮重新拉起。
+    global browser, page, _chrome_temp_dir
+    if browser is not None:
+        try:
+            browser.quit()
+        except Exception:
+            pass
+    browser = None
+    page = None
+    # 停掉本轮本地代理转发（若有）
+    try:
+        from proxy_local_forward import stop_local_forward
+
+        stop_local_forward()
+    except Exception:
+        pass
+    if _chrome_temp_dir and os.path.isdir(_chrome_temp_dir):
+        shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
+    _chrome_temp_dir = ""
+
+
+def restart_browser():
+    # 整机重启以切换代理与随机特征（池轮换依赖新 Chromium 进程）。
+    # 注意：main 循环改为「先 start 再打第 N 轮标题」，优先用 stop+start 由 main 编排。
+    stop_browser()
+    start_browser()
+
+
+def refresh_active_page():
+    # 验证码确认后页面会跳转，旧 page 句柄可能断开，这里统一重新获取当前活动标签页。
+    global browser, page
+    if browser is None:
+        start_browser()
+    try:
+        tabs = browser.get_tabs()
+        if tabs:
+            page = tabs[-1]
+        else:
+            page = browser.new_tab()
+    except Exception:
+        restart_browser()
+    return page
+
+
+# 注册页「使用邮箱注册」：失败时优先降级代理并换下一条，连通后再继续
+_EMAIL_SIGNUP_FIND_TRIES = 5
+
+
+def open_signup_page(*, find_tries: int | None = None):
+    """打开注册页并点击「使用邮箱注册」。
+
+    对齐 GrokRegisterAgent4 主流程：刷新/重开找按钮，中途不狂 demote。
+    硬失败（chrome-error / This site can't be reached）：立即降级代理并缩短重试。
+    注意：page.url 可能仍显示 accounts.x.ai，但文档实为 chrome-error 页——以 body/diag 为准。
+    """
+    global page, _browser_proxy
+    # W2 · 若上一轮已捕获 CF，在打开注册前再写一次（clear 后可能被导航冲掉）
+    try:
+        from cf_context import restore_cloudflare_context, get_thread_cf_context
+
+        if page is not None and get_thread_cf_context() and get_thread_cf_context().ready:
+            restore_cloudflare_context(page, log=lambda m: print(m, flush=True))
+    except Exception:
+        pass
+    tries = int(find_tries if find_tries is not None else _EMAIL_SIGNUP_FIND_TRIES)
+    tries = max(1, min(tries, 10))
+    last_err: Exception | str | None = None
+    demoted_this_open: set[str] = set()
+    hard_fail_streak = 0
+
+    def _is_signup_host(url: str) -> bool:
+        u = (url or "").lower()
+        if _is_chrome_error_url(u):
+            return False
+        return any(
+            h in u
+            for h in (
+                "accounts.x.ai",
+                "x.ai/sign",
+                "grok.x.ai",
+                "auth.x.ai",
+            )
+        )
+
+    def _is_chrome_error_url(url: str) -> bool:
+        u = (url or "").lower()
+        return (
+            u.startswith("chrome-error://")
+            or u.startswith("chrome://")
+            or "chromewebdata" in u
+            or u in ("", "about:blank", "about:newtab")
+        )
+
+    def _proxy_err_text(blob: str) -> bool:
+        """仅识别真网络/代理故障；勿匹配业务中文里的「代理/隧道」。"""
+        raw = blob or ""
+        b = raw.lower()
+        # 保留 chrome-error / can't be reached 等硬信号；去掉我们自己注入的文案以免二次匹配干扰
+        hard = (
+            "err_proxy",
+            "err_tunnel",
+            "err_socks",
+            "err_connection_reset",
+            "err_connection_closed",
+            "err_connection_refused",
+            "err_connection_timed_out",
+            "err_timed_out",
+            "err_name_not_resolved",
+            "err_address_unreachable",
+            "err_ssl_protocol_error",
+            "err_ssl_version",
+            "err_empty_response",
+            "err_internet_disconnected",
+            "chrome-error://",
+            "chromewebdata",
+            "this site can't be reached",
+            "this site can’t be reached",
+            "took too long to respond",
+            "connection timed out",
+            "connection refused",
+            "proxy connection failed",
+            "tunnel connection failed",
+            "err_proxy_connection_failed",
+            "err_tunnel_connection_failed",
+            "注册页无法访问",
+            "代理/隧道错误",
+        )
+        if any(k in b for k in hard):
+            return True
+        if "无法访问此网站" in raw or "网页无法打开" in raw:
+            return True
+        return False
+
+    def _page_is_dead(title: str, url: str, body_hint: str = "") -> bool:
+        """当前标签是否像错误页。
+
+        page.url 常仍是目标 URL，但 href/body 是 chrome-error——必须查 body_hint。
+        """
+        if _is_chrome_error_url(url):
+            return True
+        if _proxy_err_text(f"{title}\n{url}\n{body_hint}"):
+            return True
+        return False
+
+    def _demote_and_rotate(reason: str) -> bool:
+        global _browser_proxy
+        cur = str(_browser_proxy or "").strip()
+        if not cur:
+            return False
+        try:
+            from pools import (
+                demote_proxy_to_pending,
+                is_singbox_proxy_mode,
+                next_proxy,
+                should_skip_proxy_demote,
+            )
+
+            # sing-box：Node 换出站节点，本地 127.0.0.1:2080 不变，须重启浏览器
+            if is_singbox_proxy_mode():
+                demote_proxy_to_pending(cur, reason=reason[:160])
+                try:
+                    restart_browser()
+                except Exception as re:
+                    print(f"[Warn] restart_browser 失败: {re}", flush=True)
+                return True
+
+            # CF 独立 / 本机环回：固定单节点，禁止当池剔除，仅重启浏览器重试
+            if should_skip_proxy_demote(cur):
+                if cur not in demoted_this_open:
+                    demoted_this_open.add(cur)
+                    print(
+                        f"[*] CF/本机代理保持不变（不降级）: {cur[:72]}… · {reason[:100]}",
+                        flush=True,
+                    )
+                try:
+                    restart_browser()
+                except Exception as re:
+                    print(f"[Warn] restart_browser 失败: {re}", flush=True)
+                return True
+
+            if cur not in demoted_this_open:
+                demote_proxy_to_pending(cur, reason=reason[:160])
+                demoted_this_open.add(cur)
+            nxt = next_proxy()
+            if nxt and nxt != cur:
+                _browser_proxy = nxt
+                print(f"[*] 代理已降级并切换: `{nxt}` · {reason[:80]}", flush=True)
+                try:
+                    restart_browser()
+                except Exception as re:
+                    print(f"[Warn] restart_browser 失败: {re}", flush=True)
+                return True
+            print(f"[Warn] 代理已降级但无更多可用节点: {reason[:100]}", flush=True)
+            try:
+                restart_browser()
+            except Exception:
+                pass
+            return False
+        except Exception as de:
+            print(f"[Warn] 代理降级/切换失败: {de}", flush=True)
+            return False
+
+    for attempt in range(1, tries + 1):
+        try:
+            refresh_active_page()
+            _apply_stealth_patches(page)
+            try:
+                page.get(SIGNUP_URL)
+            except Exception as ge:
+                last_err = ge
+                # 仅真 net 错误才 demote（对齐 Agent4：开页失败多数只重开标签）
+                if _browser_proxy and _proxy_err_text(str(ge)):
+                    hard_fail_streak += 1
+                    _demote_and_rotate(f"开页失败: {str(ge)[:80]}")
+                    time.sleep(0.4 + secrets.randbelow(30) / 100.0)
+                    continue
+                try:
+                    refresh_active_page()
+                    page = browser.new_tab(SIGNUP_URL)
+                except Exception as ge2:
+                    last_err = ge2
+                    if _browser_proxy and _proxy_err_text(str(ge2)):
+                        hard_fail_streak += 1
+                        _demote_and_rotate(f"开页失败: {str(ge2)[:80]}")
+                        time.sleep(0.4 + secrets.randbelow(30) / 100.0)
+                        continue
+
+            _apply_stealth_patches(page)
+            # SPA 首屏：x.ai 注册页常 2～4s 才出 Sign up with email
+            time.sleep(2.0 + secrets.randbelow(120) / 100.0)
+
+            title = ""
+            url = ""
+            body_hint = ""
+            try:
+                title = str(getattr(page, "title", None) or "")
+                url = str(getattr(page, "url", None) or "")
+            except Exception:
+                pass
+            # page.url 可能仍是 accounts.x.ai；从文档读真实 href/正文
+            try:
+                snap = page.run_js(
+                    """
+return JSON.stringify({
+  href: (location && location.href) || '',
+  doc: (document.documentURI || document.URL || ''),
+  title: document.title || '',
+  body: ((document.body && document.body.innerText) || '').slice(0, 220)
+});
+                    """
+                )
+                if isinstance(snap, str) and snap.startswith("{"):
+                    import json as _json
+
+                    d = _json.loads(snap)
+                    real_href = str(d.get("href") or d.get("doc") or "")
+                    body_hint = str(d.get("body") or "")
+                    if real_href:
+                        # 优先 chrome-error 真实地址
+                        if _is_chrome_error_url(real_href) or not url:
+                            url = real_href
+                    if d.get("title") and not title:
+                        title = str(d.get("title") or "")
+            except Exception:
+                pass
+
+            # 硬错误页（含 url 仍显示 accounts.x.ai 但 body 为 can't be reached）→ demote
+            if _browser_proxy and _page_is_dead(title, url, body_hint):
+                hard_fail_streak += 1
+                _demote_and_rotate(
+                    f"注册页不可达(attempt {attempt}): "
+                    f"{(title or url or body_hint)[:100]}"
+                )
+                # 连续硬失败：不必 5 次空刷同一坏代理
+                if hard_fail_streak >= 2 and attempt >= 2:
+                    last_err = Exception(
+                        f"连续硬失败({hard_fail_streak})·代理不可达: "
+                        f"{(url or title or body_hint)[:120]}"
+                    )
+                    break
+                time.sleep(0.5 + secrets.randbelow(40) / 100.0)
+                continue
+
+            try:
+                # 已在目标域且非错误页：给更长找按钮时间（Cloudflare/SPA）
+                live_signup = _is_signup_host(url) and not _page_is_dead(
+                    title, url, body_hint
+                )
+                btn_timeout = 22 if live_signup else (14 if attempt == 1 else 12)
+                click_email_signup_button(timeout=btn_timeout)
+                if attempt > 1:
+                    print(f"[*] 「使用邮箱注册」第 {attempt}/{tries} 次找到并点击", flush=True)
+                return
+            except Exception as e:
+                last_err = e
+                err_s = str(e)
+                print(
+                    f"[Warn] 未找到「使用邮箱注册」({attempt}/{tries}): {err_s}"
+                    + (f" · url={url[:80]}" if url else ""),
+                    flush=True,
+                )
+                # 异常文案/diag 含 chrome-error / can't be reached → 硬失败 demote
+                hard = _proxy_err_text(err_s) or _is_chrome_error_url(url) or _page_is_dead(
+                    title, url, body_hint + "\n" + err_s
+                )
+                if _browser_proxy and hard:
+                    hard_fail_streak += 1
+                    _demote_and_rotate(
+                        f"未找到邮箱注册按钮({attempt}/{tries}): 硬网络/代理失败"
+                    )
+                    if hard_fail_streak >= 2 and attempt >= 2:
+                        break
+                    time.sleep(0.5 + secrets.randbelow(40) / 100.0)
+                    continue
+
+                hard_fail_streak = 0  # 非硬失败，可能是 SPA 慢
+                if attempt < tries:
+                    try:
+                        if attempt >= 3:
+                            page = browser.new_tab(SIGNUP_URL)
+                        else:
+                            page.refresh()
+                    except Exception:
+                        try:
+                            page = browser.new_tab(SIGNUP_URL)
+                        except Exception:
+                            pass
+                    time.sleep(0.8 + secrets.randbelow(50) / 100.0)
+        except Exception as outer:
+            last_err = outer
+            print(f"[Warn] open_signup_page 异常({attempt}/{tries}): {outer}", flush=True)
+            if _browser_proxy and _proxy_err_text(str(outer)):
+                hard_fail_streak += 1
+                _demote_and_rotate(f"open_signup 异常: {str(outer)[:80]}")
+            time.sleep(0.4 + secrets.randbelow(30) / 100.0)
+
+    # 用尽重试 / 提前 break：硬失败则 demote（CF/本机代理跳过）
+    try:
+        from pools import demote_proxy_to_pending, should_skip_proxy_demote
+
+        cur = str(_browser_proxy or "").strip()
+        title_f = url_f = body_f = ""
+        try:
+            title_f = str(getattr(page, "title", None) or "")
+            url_f = str(getattr(page, "url", None) or "")
+        except Exception:
+            pass
+        err_blob = str(last_err or "")
+        hard_final = (
+            _proxy_err_text(err_blob)
+            or _page_is_dead(title_f, url_f, err_blob)
+            or hard_fail_streak > 0
+        )
+        if (
+            cur
+            and cur not in demoted_this_open
+            and hard_final
+            and not should_skip_proxy_demote(cur)
+        ):
+            demote_proxy_to_pending(
+                cur, reason="未找到邮箱注册按钮(硬失败/代理不可达)"
+            )
+        elif cur and hard_final and should_skip_proxy_demote(cur):
+            print(
+                f"[Warn] CF/本机代理开页失败且已重试耗尽: {cur[:72]}… · "
+                f"{(err_blob or title_f or url_f)[:120]}",
+                flush=True,
+            )
+        # 真在 accounts.x.ai 活页却找不到按钮：不 demote
+    except Exception:
+        pass
+
+    err_blob = str(last_err or "")
+    if _proxy_err_text(err_blob) or hard_fail_streak > 0:
+        hint = "；根因=代理/网络不可达（chrome-error / can't be reached），已尝试降级代理"
+    elif "accounts.x.ai" in err_blob.lower() and "chrome-error" not in err_blob.lower():
+        hint = "；若页面已正常打开仍无按钮，多半是文案/结构变化或加载慢"
+    else:
+        hint = ""
+    raise Exception(
+        f'未找到“使用邮箱注册”按钮（本轮已重试 {tries} 次）'
+        + (f": {last_err}" if last_err else "")
+        + hint
+    )
+
+
+def close_current_page():
+    # 兼容旧调用名，实际行为改为整轮重启浏览器。
+    restart_browser()
+
+
+def has_profile_form():
+    # 最终注册页只要出现姓名和密码输入框，就认为已经成功进入资料填写阶段。
+    refresh_active_page()
+    try:
+        return bool(page.run_js(
+            """
+const givenInput = document.querySelector('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
+const familyInput = document.querySelector('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
+const passwordInput = document.querySelector('input[data-testid="password"], input[name="password"], input[type="password"]');
+return !!(givenInput && familyInput && passwordInput);
+            """
+        ))
+    except Exception:
+        return False
+
+
+def _step_pause(lo_ms: int = 180, hi_ms: int = 650) -> None:
+    """注册步骤间短随机停顿（有限行为随机）。"""
+    try:
+        if human_pause is not None:
+            human_pause(lo_ms, hi_ms)
+            return
+    except Exception:
+        pass
+    time.sleep(0.2 + secrets.randbelow(40) / 100.0)
+
+
+def click_email_signup_button(timeout=10):
+    """页面打开后点击「使用邮箱注册 / Sign up with email」。
+
+    2026-07：accounts.x.ai 文案为 Sign up with email；
+    已进入 accounts.x.ai 时禁止用正文里的 proxy/blocked 字样误判为隧道错误。
+    """
+    _step_pause(200, 700)
+    deadline = time.time() + timeout
+    last_diag = ""
+    while time.time() < deadline:
+        try:
+            refresh_active_page()
+        except Exception:
+            pass
+
+        # 若已出现邮箱输入框，视为已在邮箱注册步，无需再点按钮
+        try:
+            already = page.run_js(
+                r"""
+const inputs = Array.from(document.querySelectorAll(
+  'input[type="email"], input[name*="email" i], input[autocomplete="email"], input[placeholder*="email" i], input[placeholder*="邮箱"]'
+));
+function vis(n){
+  if(!n) return false;
+  const s=getComputedStyle(n);
+  if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
+  const r=n.getBoundingClientRect();
+  return r.width>0 && r.height>0;
+}
+return inputs.some(vis);
+"""
+            )
+            if already is True or already == "true" or already == 1:
+                return True
+        except Exception:
+            pass
+
+        # Drission 文本定位兜底（不依赖 JS 可见性）
+        for txt in (
+            "Sign up with email",
+            "Sign up with Email",
+            "使用邮箱注册",
+            "用邮箱注册",
+            "邮箱注册",
+            "Continue with email",
+            "Continue with Email",
+        ):
+            try:
+                ele = page.ele(f"text:{txt}", timeout=0.35)
+                if ele:
+                    try:
+                        ele.click()
+                    except Exception:
+                        try:
+                            page.run_js("arguments[0].click()", ele)
+                        except Exception:
+                            ele.click(by_js=True)
+                    _step_pause(150, 500)
+                    return True
+            except Exception:
+                pass
+
+        clicked = page.run_js(r"""
+function isVisible(n) {
+  if (!n) return false;
+  const s = window.getComputedStyle(n);
+  if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+  const r = n.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+function norm(s) {
+  return (s || '').replace(/\s+/g, '').toLowerCase();
+}
+function matchEmailSignup(text, aria, testid) {
+  const t = norm(text);
+  const a = norm(aria);
+  const d = norm(testid);
+  const blob = t + ' ' + a + ' ' + d;
+  if (!blob.trim()) return false;
+  // 中文
+  if (t.includes('使用邮箱注册') || t.includes('用邮箱注册') || t.includes('邮箱注册')) return true;
+  if (a.includes('使用邮箱注册') || a.includes('邮箱注册')) return true;
+  // 英文（去空格）：Sign up with email → signupwithemail
+  if (blob.includes('signupwithemail') || blob.includes('signupemail') || blob.includes('emailsignup')) return true;
+  if (blob.includes('continuewithemail') || blob.includes('continuewithmail')) return true;
+  if (blob.includes('createwithemail') || blob.includes('createaccountwithemail')) return true;
+  // email + sign/create/continue/注册（避免仅 “email” 误点）
+  if ((t.includes('email') || a.includes('email')) &&
+      (t.includes('sign') || t.includes('注册') || t.includes('continue') || t.includes('create') ||
+       a.includes('sign') || a.includes('continue') || a.includes('create'))) {
+    // 排除 Sign in / 登录
+    if (t.includes('signin') || t === 'email' || t.includes('signinemail')) return false;
+    if (t.includes('登录') && !t.includes('注册')) return false;
+    return true;
+  }
+  return false;
+}
+// 扩大候选：含 label、可点 div、data-testid
+const sel = [
+  'button', 'a', '[role="button"]',
+  'div[role="button"]', 'span[role="button"]',
+  '[data-testid*="email"]', '[data-testid*="sign"]',
+  'label', '[tabindex="0"]'
+].join(',');
+let candidates = Array.from(document.querySelectorAll(sel)).filter(isVisible);
+// 再扫一遍可见元素的文本节点父级（SPA 常把文案放在内层 span）
+const more = Array.from(document.querySelectorAll('button *, a *, [role="button"] *'))
+  .filter(isVisible)
+  .map((n) => n.closest('button, a, [role="button"], div, span') || n);
+candidates = candidates.concat(more);
+
+let target = null;
+const seen = new Set();
+for (const node of candidates) {
+  if (!node || seen.has(node)) continue;
+  seen.add(node);
+  const text = node.innerText || node.textContent || '';
+  const aria = node.getAttribute('aria-label') || node.getAttribute('title') || '';
+  const testid = node.getAttribute('data-testid') || node.id || '';
+  if (matchEmailSignup(text, aria, testid)) {
+    // 优先点最外层可点祖先
+    target = node.closest('button, a, [role="button"]') || node;
+    break;
+  }
+}
+
+if (!target) {
+  const href = (location && location.href) || '';
+  const docUri = (document.documentURI || document.URL || '') || '';
+  const body = (document.body && (document.body.innerText || '')) || '';
+  const title = document.title || '';
+  const bodyTrim = body.trim();
+  // 真 chrome 错误页：href 常是 chrome-error://，但 Chromium 有时 page.url 仍显示目标站
+  const chromeErr = /chrome-error:\/\/|chromewebdata|chrome:\/\/error/i.test(href + ' ' + docUri);
+  const hardNet = /err_proxy|err_tunnel|err_socks|err_connection_|err_timed_out|err_name_not_resolved|err_address_unreachable|err_ssl_|err_empty_response|this site can.?t be reached|took too long to respond|connection timed out|connection refused|tunnel connection failed|proxy connection failed|无法访问此网站|网页无法打开/i.test(body + ' ' + title);
+  // 仅「非错误页」且在 x.ai 才算 onXai；错误页上的 accounts.x.ai 字样不算活页
+  const onXai = !chromeErr && !hardNet && /accounts\.x\.ai|x\.ai\/sign|auth\.x\.ai|grok\.x\.ai/i.test(href);
+  // 诊断摘要（回传 Python，勿过长）
+  const sampleBtns = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .filter(isVisible)
+    .slice(0, 12)
+    .map((n) => (n.innerText || n.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 40))
+    .filter(Boolean);
+  const diag = JSON.stringify({
+    title: (title || '').slice(0, 80),
+    href: (chromeErr ? (href || docUri) : href).slice(0, 120),
+    bodyLen: bodyTrim.length,
+    bodyHead: bodyTrim.slice(0, 160),
+    btns: sampleBtns,
+    chromeErr: !!chromeErr,
+    hardNet: !!hardNet
+  });
+
+  if (!bodyTrim && !title.trim()) return 'empty|' + diag;
+  // 硬错误页一律 blocked（即使 body 里出现了目标 URL 文案）
+  if (chromeErr || hardNet) {
+    return 'blocked|' + diag;
+  }
+  return 'miss|' + diag;
+}
+
+try { target.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+try { target.focus(); } catch (e) {}
+try { target.click(); } catch (e) {
+  try {
+    target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  } catch (e2) {}
+}
+return true;
+        """)
+
+        if clicked is True or clicked == "true" or clicked == 1:
+            _step_pause(150, 500)
+            return True
+
+        kind = ""
+        diag = ""
+        if isinstance(clicked, str) and "|" in clicked:
+            kind, diag = clicked.split("|", 1)
+            last_diag = diag
+        elif isinstance(clicked, str):
+            kind = clicked
+
+        if kind == "blocked":
+            # 真·错误页：由 open_signup_page 处理；带诊断
+            raise Exception(
+                "注册页无法访问（代理/隧道错误，未找到邮箱注册按钮）"
+                + (f" diag={last_diag[:200]}" if last_diag else "")
+            )
+        if kind == "empty":
+            time.sleep(0.9)
+        else:
+            # miss：SPA 未出按钮，继续等
+            time.sleep(0.45 + secrets.randbelow(35) / 100.0)
+
+    # 超时：硬错误 vs 真活页结构问题
+    url_hint = ""
+    try:
+        url_hint = str(getattr(page, "url", None) or "")
+    except Exception:
+        pass
+    msg = '未找到“使用邮箱注册”按钮'
+    diag_l = (last_diag or "").lower()
+    hard = (
+        "chrome-error" in diag_l
+        or "chromewebdata" in diag_l
+        or "can't be reached" in diag_l
+        or "can’t be reached" in diag_l
+        or '"chromeerr":true' in diag_l
+        or '"hardnet":true' in diag_l
+    )
+    if hard:
+        msg += "（代理/网络不可达）"
+    elif "accounts.x.ai" in (url_hint or "").lower():
+        msg += f"（已在 accounts.x.ai 活页，非代理问题；请查按钮文案/结构） url={url_hint[:100]}"
+    if last_diag:
+        msg += f" diag={last_diag[:240]}"
+    raise Exception(msg)
+
+
+
+
+def _pure_browser_pause(min_ms: int = 400, max_ms: int = 1200) -> None:
+    """纯浏览器模式加长拟人停顿；非 pure 时用普通 _step_pause。"""
+    if _pure_browser_mode():
+        try:
+            _step_pause(min_ms, max_ms)
+        except Exception:
+            import random, time as _t
+            _t.sleep(random.uniform(min_ms/1000, max_ms/1000))
+    else:
+        try:
+            _step_pause(min(min_ms, 250), min(max_ms, 800))
+        except Exception:
+            pass
+
+def _pure_browser_mouse_wander(steps: int | None = None) -> None:
+    """pure 模式 CDP 指针游走（无 JS 合成 MouseEvent）。"""
+    if not _pure_browser_mode():
+        return
+    try:
+        import random as _r
+        n = int(steps if steps is not None else (8 + secrets.randbelow(10)))
+        x = 140.0 + _r.random() * 520
+        y = 160.0 + _r.random() * 340
+        for _i in range(max(3, n)):
+            x += _r.uniform(-40, 70)
+            y += _r.uniform(-25, 45)
+            x = max(8.0, min(1400.0, x))
+            y = max(8.0, min(900.0, y))
+            page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=float(x), y=float(y))
+            time.sleep(0.015 + _r.random() * 0.04)
+    except Exception:
+        pass
+
+
+def _pure_browser_mode() -> bool:
+    """True = Plan A/B 禁用协议 CreateEmail/Verify + hybrid 收尾，走纯 UI。
+
+    config: register_pure_browser=true 或 protocol_mail_enabled=false
+    env: REGISTER_PURE_BROWSER / PURE_BROWSER / PROTOCOL_MAIL_ENABLED
+    """
+    env_pure = (
+        os.environ.get("REGISTER_PURE_BROWSER")
+        or os.environ.get("PURE_BROWSER")
+        or ""
+    ).strip().lower()
+    if env_pure in ("1", "true", "yes", "on"):
+        return True
+    env_pm = (os.environ.get("PROTOCOL_MAIL_ENABLED") or "").strip().lower()
+    if env_pm in ("0", "false", "no", "off"):
+        return True
+    try:
+        import json as _j
+        conf = _j.loads(
+            open(os.path.join(os.path.dirname(__file__), "config.json"), encoding="utf-8").read()
+        )
+    except Exception:
+        conf = {}
+    if conf.get("register_pure_browser") is True:
+        return True
+    if str(conf.get("register_pure_browser") or "").lower() in ("1", "true", "yes", "on"):
+        return True
+    if conf.get("protocol_mail_enabled") is False:
+        return True
+    if str(conf.get("protocol_mail_enabled") or "").lower() in ("0", "false", "no", "off"):
+        return True
+    return False
+
+def fill_email_and_submit(timeout=15):
+    """填邮箱并提交。优先 CDP 真人键入 + 表单内 submit（避免假成功 / Something went wrong）。"""
+    _step_pause(250, 800)
+    email, dev_token = get_email_and_token()
+    if not email or not dev_token:
+        raise Exception("获取邮箱失败")
+
+    # 优先协议发码（UI 自动化常 Something went wrong）。pure_browser 强制走 UI 以绑定 React castle。
+    if _pure_browser_mode():
+        print("[*] pure_browser=1 · 跳过协议 CreateEmail，走 UI 发码", flush=True)
+        _pure_browser_pause(800, 2200)
+        # CDP 真实鼠标轨迹（比 JS 合成 MouseEvent 更像真人；Castle 看 pointer 流）
+        try:
+            import random as _rnd
+
+            x0 = 120 + _rnd.randint(0, 420)
+            y0 = 140 + _rnd.randint(0, 280)
+            x1 = x0 + _rnd.randint(-80, 160)
+            y1 = y0 + _rnd.randint(-40, 120)
+            steps = 10 + _rnd.randint(0, 10)
+            for i in range(1, steps + 1):
+                t = i / steps
+                ease = t * t * (3 - 2 * t)
+                page.run_cdp(
+                    "Input.dispatchMouseEvent",
+                    type="mouseMoved",
+                    x=float(x0 + (x1 - x0) * ease + _rnd.uniform(-1.5, 1.5)),
+                    y=float(y0 + (y1 - y0) * ease + _rnd.uniform(-1.5, 1.5)),
+                )
+                time.sleep(0.012 + _rnd.random() * 0.025)
+            try:
+                page.run_js(
+                    "try{window.scrollBy(0, 18+Math.floor(Math.random()*50));}catch(e){} true;"
+                )
+            except Exception:
+                pass
+        except Exception as _me:
+            print(f"[Warn] pure mouse wander: {_me}", flush=True)
+        _pure_browser_pause(400, 1200)
+    else:
+        try:
+            from protocol_mail import protocol_create_email_code as _pce
+
+            _pr0 = _pce(email, log=lambda m: print(m, flush=True))
+            if _pr0.get("ok"):
+                print(f"[*] 协议 CreateEmail 优先成功: {email}（跳过 UI 提交发码）", flush=True)
+                # 仍尽量把邮箱填进页面，便于后续 OTP/资料页
+                try:
+                    page.run_js(
+                        """
+const email = arguments[0];
+const input = document.querySelector(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+);
+if (!input) return false;
+input.focus();
+const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+const tracker = input._valueTracker;
+if (tracker) tracker.setValue('');
+if (setter) setter.call(input, email); else input.value = email;
+input.dispatchEvent(new Event('input', { bubbles: true }));
+input.dispatchEvent(new Event('change', { bubbles: true }));
+return true;
+""",
+                        email,
+                    )
+                except Exception:
+                    pass
+                _step_pause(200, 600)
+                return email, dev_token
+            print(f"[Warn] 协议 CreateEmail 优先失败，回退 UI: {_pr0}", flush=True)
+        except Exception as _pe0:
+            print(f"[Warn] 协议 CreateEmail 不可用，回退 UI: {_pe0}", flush=True)
+
+    def _page_error_snapshot():
+        try:
+            return page.run_js(
+                r"""
+const body = (document.body && (document.body.innerText || document.body.textContent) || '');
+const err = /something went wrong|try again|出错了|出了点问题|trace id/i.test(body);
+const otp = !!document.querySelector(
+  'input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"]'
+);
+return {
+  err: err,
+  otp: otp,
+  url: location.href.slice(0, 160),
+  snippet: body.replace(/\s+/g, ' ').trim().slice(0, 220),
+};
+"""
+            )
+        except Exception as e:
+            return {"err": False, "otp": False, "error": str(e)}
+
+    def _cdp_type_email(value: str) -> str:
+        """CDP 点击输入框后逐字 insertText，尽量触发 React 受控状态。"""
+        try:
+            loc = page.run_js(
+                r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const input = Array.from(document.querySelectorAll(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+)).find((n) => isVisible(n) && !n.disabled && !n.readOnly) || null;
+if (!input) return null;
+input.scrollIntoView({ block: 'center', inline: 'center' });
+const r = input.getBoundingClientRect();
+input.focus();
+try { input.click(); } catch (e) {}
+try { input.select(); } catch (e) {}
+return { x: r.x + r.width / 2, y: r.y + r.height / 2, val: String(input.value || '') };
+"""
+            )
+        except Exception as e:
+            return f"locate-fail:{e}"
+        if not isinstance(loc, dict):
+            return "no-input"
+        try:
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyDown",
+                key="a",
+                code="KeyA",
+                modifiers=2,
+                windowsVirtualKeyCode=65,
+            )
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyUp",
+                key="a",
+                code="KeyA",
+                modifiers=2,
+                windowsVirtualKeyCode=65,
+            )
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyDown",
+                key="Backspace",
+                code="Backspace",
+                windowsVirtualKeyCode=8,
+            )
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyUp",
+                key="Backspace",
+                code="Backspace",
+                windowsVirtualKeyCode=8,
+            )
+            time.sleep(0.05)
+            pure = False
+            try:
+                pure = _pure_browser_mode()
+            except Exception:
+                pure = False
+            for ch in str(value):
+                page.run_cdp("Input.insertText", text=ch)
+                if pure:
+                    # 拟人：更慢、方差更大，偶发短停
+                    time.sleep(0.045 + secrets.randbelow(90) / 1000.0)
+                    if secrets.randbelow(12) == 0:
+                        time.sleep(0.12 + secrets.randbelow(25) / 100.0)
+                else:
+                    time.sleep(0.012 + secrets.randbelow(18) / 1000.0)
+            time.sleep(0.15)
+            cur = page.run_js(
+                r"""
+const input = document.querySelector(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+);
+return input ? String(input.value || '') : '';
+"""
+            )
+            if str(cur or "").strip() == str(value).strip():
+                return "cdp-ok"
+            fb = page.run_js(
+                """
+const email = arguments[0];
+const input = document.querySelector(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+);
+if (!input) return 'no-input';
+input.focus();
+const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+const tracker = input._valueTracker;
+if (tracker) tracker.setValue(input.value || '');
+if (setter) setter.call(input, email); else input.value = email;
+const rk = Object.keys(input).find((k) => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+if (rk && input[rk]) {
+  const p = input[rk];
+  const ev = { target: input, currentTarget: input, bubbles: true };
+  try { if (p.onChange) p.onChange({ ...ev, type: 'change' }); } catch (e) {}
+  try { if (p.onInput) p.onInput({ ...ev, type: 'input' }); } catch (e) {}
+}
+input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
+input.dispatchEvent(new Event('change', { bubbles: true }));
+return (input.value || '') === email ? 'react-ok' : 'mismatch:' + (input.value || '');
+""",
+                value,
+            )
+            return str(fb or "fallback-fail")
+        except Exception as e:
+            return f"cdp-err:{e}"
+
+    def _submit_email_form():
+        """只点邮箱 input 所在 form 内的 submit，避免点到外层 Sign up Sign up。"""
+        return page.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function btnText(node) {
+  return [node.innerText, node.textContent, node.getAttribute('aria-label')]
+    .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function isSocial(t) {
+  const c = String(t || '').replace(/\s+/g, '').toLowerCase();
+  return c.includes('google') || c.includes('apple') || c.includes('github')
+    || c.includes('microsoft') || c.includes('twitter') || c.includes('withemail');
+}
+const input = Array.from(document.querySelectorAll(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+)).find((n) => isVisible(n) && !n.disabled) || null;
+if (!input || !(input.value || '').trim()) return { ok: false, why: 'no-email-value' };
+
+const form = input.closest('form');
+const scope = form || document;
+const candidates = Array.from(scope.querySelectorAll(
+  'button[type="submit"], input[type="submit"], button'
+)).filter((n) => isVisible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true');
+
+function score(n) {
+  const raw = btnText(n);
+  const c = raw.replace(/\s+/g, '');
+  const t = c.toLowerCase();
+  if (isSocial(raw)) return -1;
+  if (c === '注册' || t === 'signup' || t === 'register' || t === 'continue' || c === '继续') return 100;
+  if (n.type === 'submit') return 90;
+  if (t.includes('signup') && !t.includes('with')) return 80;
+  if (t.includes('continue') || t.includes('next') || c.includes('下一步')) return 75;
+  return 0;
+}
+const ranked = candidates.map((n) => ({ n, s: score(n), t: btnText(n) }))
+  .filter((x) => x.s > 0).sort((a, b) => b.s - a.s);
+if (ranked.length) {
+  const btn = ranked[0].n;
+  btn.focus();
+  btn.click();
+  return { ok: true, how: 'form-btn', btn: (ranked[0].t || '').slice(0, 48), score: ranked[0].s };
+}
+if (form) {
+  try {
+    if (form.requestSubmit) form.requestSubmit();
+    else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    return { ok: true, how: 'requestSubmit' };
+  } catch (e) {
+    return { ok: false, why: 'requestSubmit-fail:' + String(e) };
+  }
+}
+input.focus();
+input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+return { ok: true, how: 'enter' };
+"""
+        )
+
+    deadline = time.time() + max(20, int(timeout or 15))
+    while time.time() < deadline:
+        snap0 = _page_error_snapshot()
+        if isinstance(snap0, dict) and snap0.get("err"):
+            raise AccountRetryNeeded(
+                f"注册页错误: {(snap0.get('snippet') or 'Something went wrong')[:120]}",
+                reason="page_error",
+            )
+
+        typed = _cdp_type_email(email)
+        print(f"[*] 邮箱键入: {typed}", flush=True)
+        if (
+            "cdp-ok" not in str(typed)
+            and "react-ok" not in str(typed)
+            and not str(typed).endswith("ok")
+        ):
+            time.sleep(0.5)
+            continue
+
+        time.sleep(0.35)
+        clicked = _submit_email_form()
+        detail = ""
+        ok = False
+        if isinstance(clicked, dict):
+            ok = bool(clicked.get("ok"))
+            detail = f" how={clicked.get('how')} btn={clicked.get('btn') or ''}"
+        else:
+            ok = bool(clicked)
+        if not ok:
+            print(f"[Debug] 提交失败: {clicked}", flush=True)
+            time.sleep(0.5)
+            continue
+
+        print(f"[*] 已填写邮箱并点击注册: {email}{detail}", flush=True)
+
+        otp_ok = False
+        page_err = None
+        for _ in range(24):
+            snap = _page_error_snapshot()
+            if isinstance(snap, dict):
+                if snap.get("err"):
+                    page_err = snap.get("snippet") or "Something went wrong"
+                    break
+                if snap.get("otp"):
+                    otp_ok = True
+                    break
+            time.sleep(0.5)
+
+        if otp_ok:
+            print(f"[*] 已进入验证码页: {email}", flush=True)
+            _step_pause(200, 600)
+            return email, dev_token
+
+        if page_err:
+            print(
+                f"[Warn] UI 提交报错（常见 Something went wrong），改走协议发码: "
+                f"{str(page_err)[:100]}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Warn] 提交后未出现 OTP 页，改走协议 CreateEmail: {email}",
+                flush=True,
+            )
+        if _pure_browser_mode():
+            raise Exception(
+                "pure_browser=1 · UI 未进入 OTP 且禁止协议 CreateEmail 回退"
+            )
+        break  # leave UI loop → protocol below
+
+    # —— 协议发码（已验证 curl_cffi+proxy 可 grpc-status:0 且入信）——
+    if _pure_browser_mode():
+        raise Exception("pure_browser=1 · 禁止协议 CreateEmail 回退")
+    try:
+        from protocol_mail import protocol_create_email_code
+
+        pr = protocol_create_email_code(email, log=lambda m: print(m, flush=True))
+    except Exception as pe:
+        pr = {"ok": False, "error": str(pe)}
+    if pr.get("ok"):
+        print(f"[*] 协议 CreateEmail 成功: {email}", flush=True)
+        _step_pause(200, 600)
+        return email, dev_token
+    raise AccountRetryNeeded(
+        f"协议 CreateEmail 失败: {pr}",
+        reason="protocol_create_fail",
+    )
+
+
+class AccountRetryNeeded(Exception):
+    """收码/邮箱阶段可换邮箱重试（不消耗整轮代理降级逻辑）。"""
+
+    def __init__(self, message: str = "account retry needed", *, reason: str = "mail"):
+        super().__init__(message)
+        self.reason = reason
+
+
+def fill_code_and_submit(email, dev_token, timeout=60):
+    # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
+    code = get_oai_code(dev_token, email, timeout=90)
+    if not code:
+        raise AccountRetryNeeded("获取验证码失败", reason="code_timeout")
+
+    _step_pause(180, 550)
+    # 协议发码后通常无 OTP UI：只短等几秒，再协议 VerifyEmail
+    try:
+        has_otp = page.run_js(
+            r"""
+const n = document.querySelectorAll(
+  'input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"]'
+).length;
+return n > 0;
+"""
+        )
+    except Exception:
+        has_otp = False
+    if not has_otp:
+        if _pure_browser_mode():
+            print(
+                "[*] pure_browser=1 · 无 OTP 框，延长 UI 等待（禁止协议 Verify）…",
+                flush=True,
+            )
+            has_otp = True  # 走下方 UI 填码循环
+        else:
+            print("[*] 无 OTP 输入框，直接协议 VerifyEmail…", flush=True)
+            try:
+                from protocol_mail import protocol_verify_email_code
+
+                vr = protocol_verify_email_code(
+                    email, code, log=lambda m: print(m, flush=True)
+                )
+                if vr.get("ok"):
+                    print(
+                        f"[*] 协议 VerifyEmail 成功: {email} code={str(code).replace('-','')}",
+                        flush=True,
+                    )
+                    return code
+            except Exception as ve:
+                print(f"[Warn] 协议 VerifyEmail: {ve}", flush=True)
+    deadline = time.time() + (timeout if has_otp else min(8, int(timeout or 60)))
+    while time.time() < deadline:
+        try:
+            filled = page.run_js(
+                """
+const code = String(arguments[0] || '').trim();
+
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function setNativeValue(input, value) {
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const tracker = input._valueTracker;
+    if (tracker) {
+        tracker.setValue('');
+    }
+    if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(input, '');
+        nativeInputValueSetter.call(input, value);
+    } else {
+        input.value = '';
+        input.value = value;
+    }
+}
+
+function dispatchInputEvents(input, value) {
+    input.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+const input = Array.from(document.querySelectorAll('input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]')).find((node) => {
+    return isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || code.length || 6) > 1;
+}) || null;
+
+const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
+    if (!isVisible(node) || node.disabled || node.readOnly) {
+        return false;
+    }
+    const maxLength = Number(node.maxLength || 0);
+    const autocomplete = String(node.autocomplete || '').toLowerCase();
+    return maxLength === 1 || autocomplete === 'one-time-code';
+});
+
+if (!input && otpBoxes.length < code.length) {
+    return 'not-ready';
+}
+
+if (input) {
+    input.focus();
+    input.click();
+    setNativeValue(input, code);
+    dispatchInputEvents(input, code);
+
+    const normalizedValue = String(input.value || '').trim();
+    const expectedLength = Number(input.maxLength || code.length || 6);
+    const slots = Array.from(document.querySelectorAll('[data-input-otp-slot="true"]'));
+    const filledSlots = slots.filter((slot) => (slot.textContent || '').trim()).length;
+
+    if (normalizedValue !== code) {
+        return 'aggregate-mismatch';
+    }
+
+    if (expectedLength > 0 && normalizedValue.length !== expectedLength) {
+        return 'aggregate-length-mismatch';
+    }
+
+    if (slots.length && filledSlots && filledSlots !== normalizedValue.length) {
+        return 'aggregate-slot-mismatch';
+    }
+
+    input.blur();
+    return 'filled';
+}
+
+const orderedBoxes = otpBoxes.slice(0, code.length);
+for (let i = 0; i < orderedBoxes.length; i += 1) {
+    const box = orderedBoxes[i];
+    const char = code[i] || '';
+    box.focus();
+    box.click();
+    setNativeValue(box, char);
+    dispatchInputEvents(box, char);
+    box.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: char }));
+    box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: char }));
+    box.blur();
+}
+
+const merged = orderedBoxes.map((node) => String(node.value || '').trim()).join('');
+return merged === code ? 'filled' : 'box-mismatch';
+                """,
+                code,
+            )
+        except PageDisconnectedError:
+            # 点击确认邮箱后如果刚好发生跳转，旧页面句柄会断开；此时切到新页继续判断即可。
+            refresh_active_page()
+            if has_profile_form():
+                print("[*] 验证码提交后已跳转到最终注册页。")
+                return code
+            time.sleep(1)
+            continue
+
+        if filled == 'not-ready':
+            if has_profile_form():
+                print("[*] 已直接进入最终注册页，跳过验证码按钮确认。")
+                return code
+            time.sleep(0.5)
+            continue
+
+        if filled != 'filled':
+            print(f"[Debug] 验证码输入框已出现，但写入失败: {filled}")
+            time.sleep(0.5)
+            continue
+
+        if filled == 'filled':
+            if _pure_browser_mode():
+                _pure_browser_pause(700, 1800)
+                _pure_browser_mouse_wander(6)
+            else:
+                time.sleep(1.2)
+            try:
+                clicked = page.run_js(
+                    r"""
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const aggregateInput = Array.from(document.querySelectorAll('input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]')).find((node) => {
+    return isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 0) > 1;
+}) || null;
+
+let value = '';
+if (aggregateInput) {
+    value = String(aggregateInput.value || '').trim();
+    const expectedLength = Number(aggregateInput.maxLength || value.length || 6);
+    if (!value || (expectedLength > 0 && value.length !== expectedLength)) {
+        return false;
+    }
+
+    const slots = Array.from(document.querySelectorAll('[data-input-otp-slot="true"]'));
+    if (slots.length) {
+        const filledSlots = slots.filter((slot) => (slot.textContent || '').trim()).length;
+        if (filledSlots && filledSlots !== value.length) {
+            return false;
+        }
+    }
+} else {
+    const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
+        if (!isVisible(node) || node.disabled || node.readOnly) {
+            return false;
+        }
+        const maxLength = Number(node.maxLength || 0);
+        const autocomplete = String(node.autocomplete || '').toLowerCase();
+        return maxLength === 1 || autocomplete === 'one-time-code';
+    });
+    value = otpBoxes.map((node) => String(node.value || '').trim()).join('');
+    if (!value || value.length < 6) {
+        return false;
+    }
+}
+
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const confirmButton = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
+    const t = text.toLowerCase(); return text === '确认邮箱' || text.includes('确认邮箱') || text === '继续' || text.includes('继续') || text === '下一步' || text.includes('下一步') || t.includes('confirm') || t.includes('continue') || t.includes('next') || t.includes('verify');
+});
+
+if (!confirmButton) {
+    return 'no-button';
+}
+
+confirmButton.focus();
+confirmButton.click();
+return 'clicked';
+                    """
+                )
+            except PageDisconnectedError:
+                refresh_active_page()
+                if has_profile_form():
+                    print("[*] 确认邮箱后页面跳转成功，已进入最终注册页。")
+                    return code
+                clicked = 'disconnected'
+
+            if clicked == 'clicked':
+                print(f"[*] 已填写验证码并点击确认邮箱: {code}")
+                time.sleep(2)
+                refresh_active_page()
+                if has_profile_form():
+                    print("[*] 验证码确认完成，最终注册页已就绪。")
+                return code
+
+            if clicked == 'no-button':
+                current_url = page.url
+                if 'sign-up' in current_url or 'signup' in current_url:
+                    print(f"[*] 已填写验证码，页面已自动跳转到下一步: {current_url}")
+                    return code
+
+            if clicked == 'disconnected':
+                time.sleep(1)
+                continue
+
+        time.sleep(0.5)
+
+    debug_snapshot = page.run_js(
+        r"""
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible).map((node) => ({
+    type: node.type || '',
+    name: node.name || '',
+    testid: node.getAttribute('data-testid') || '',
+    autocomplete: node.autocomplete || '',
+    maxLength: Number(node.maxLength || 0),
+    value: String(node.value || ''),
+}));
+
+const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible).map((node) => ({
+    text: String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim(),
+    disabled: !!node.disabled,
+    ariaDisabled: node.getAttribute('aria-disabled') || '',
+}));
+
+return { url: location.href, inputs, buttons };
+        """
+    )
+    print(f"[Debug] 验证码页 DOM 摘要: {debug_snapshot}")
+    # 协议发码后浏览器通常无 OTP 页：协议 VerifyEmail，后续资料/Turnstile 由 hybrid 或资料页接
+    try:
+        from protocol_mail import protocol_verify_email_code
+
+        vr = protocol_verify_email_code(
+            email, code, log=lambda m: print(m, flush=True)
+        )
+        if vr.get("ok"):
+            print(
+                f"[*] 协议 VerifyEmail 成功（无 UI OTP）: {email} code={code}",
+                flush=True,
+            )
+            # 标记：后续 fill_profile 若无表单，run_single 应走 hybrid 收尾
+            try:
+                page.run_js(
+                    "window.__protocol_email_verified = true;"
+                    "window.__protocol_email = arguments[0];"
+                    "window.__protocol_code = arguments[1]; true;",
+                    email,
+                    code,
+                )
+            except Exception:
+                pass
+            return code
+        print(f"[Warn] 协议 VerifyEmail 失败: {vr}", flush=True)
+    except Exception as ve:
+        print(f"[Warn] 协议 VerifyEmail 异常: {ve}", flush=True)
+    raise Exception("未找到验证码输入框或确认邮箱按钮")
+
+
+def _read_turnstile_token():
+    # hybrid inject 回调 / 官方 API / 隐藏 input（页面有时只填其中一个）。
+    try:
+        token = page.run_js(
+            """
+try {
+    const hv = String(window.__hybrid_turnstile || '').trim();
+    if (hv) return hv;
+} catch (e) {}
+try {
+    if (typeof turnstile !== 'undefined' && turnstile.getResponse) {
+        const t = turnstile.getResponse();
+        if (t) return String(t);
+    }
+} catch (e) {}
+// 可能存在多个 response input（原生 + inject）
+const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'));
+let best = '';
+for (const input of inputs) {
+  const v = String(input.value || '').trim();
+  if (v.length > best.length) best = v;
+}
+return best;
+            """
+        )
+        if token:
+            return str(token).strip()
+    except Exception:
+        pass
+    try:
+        els = page.eles("@name=cf-turnstile-response", timeout=0.3) or []
+        best = ""
+        for el in els:
+            try:
+                val = (el.value or "").strip()
+            except Exception:
+                val = ""
+            if len(val) > len(best):
+                best = val
+        if best:
+            return best
+    except Exception:
+        try:
+            el = page.ele("@name=cf-turnstile-response", timeout=0.3)
+            if el:
+                val = (el.value or "").strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+    return ""
+
+def _inject_turnstile_token(token: str) -> bool:
+    """将已有 Turnstile token 写回隐藏 input（二次复用）。"""
+    token = str(token or "").strip()
+    if not token:
+        return False
+    try:
+        return bool(
+            page.run_js(
+                """
+const token = arguments[0];
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!challengeInput) return false;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) {
+  nativeSetter.call(challengeInput, token);
+} else {
+  challengeInput.value = token;
+}
+challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
+challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(challengeInput.value || '').trim() === String(token || '').trim();
+                """,
+                token,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _turnstile_widget_state():
+    """
+    观察 Turnstile 当前状态。
+    诊断日志里出现 title=Turnstile feedback report / src 含 /failure 表示已被 Cloudflare 判定失败。
+    注意：widget 可能在 closed shadow 内，页面顶层 iframe 只有 1x1 占位。
+    """
+    try:
+        return page.run_js(
+            """
+function collectFrames(root, out, depth) {
+  if (!root || depth > 6) return;
+  let list = [];
+  try { list = Array.from(root.querySelectorAll('iframe')); } catch (e) { list = []; }
+  for (const n of list) {
+    const r = n.getBoundingClientRect();
+    out.push({
+      src: n.src || '',
+      title: n.title || '',
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+      x: r.left,
+      y: r.top,
+    });
+  }
+  // 尝试 open shadow
+  let all = [];
+  try { all = Array.from(root.querySelectorAll('*')); } catch (e) { all = []; }
+  for (const el of all) {
+    if (el.shadowRoot) collectFrames(el.shadowRoot, out, depth + 1);
+  }
+}
+
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+const frames = [];
+collectFrames(document, frames, 0);
+
+// 宿主容器尺寸（即使 iframe 1x1，容器可能仍是 300x65）
+const hosts = [];
+const hostSel = [
+  '.cf-turnstile', '[data-sitekey]', 'div[id^="cf-"]',
+  'input[name="cf-turnstile-response"]'
+];
+for (const sel of hostSel) {
+  try {
+    document.querySelectorAll(sel).forEach((el) => {
+      const target = sel.includes('input') ? (el.parentElement || el) : el;
+      const r = target.getBoundingClientRect();
+      hosts.push({
+        sel,
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+        x: r.left,
+        y: r.top,
+      });
+    });
+  } catch (e) {}
+}
+
+const failure = frames.some((f) =>
+  /\\/failure/i.test(f.src) || /feedback report/i.test(f.title) || /failed/i.test(f.title)
+);
+const challenge = frames.find((f) =>
+  /challenges\\.cloudflare\\.com/i.test(f.src) && !/\\/failure/i.test(f.src) && f.w >= 20 && f.h >= 20
+) || frames.find((f) =>
+  /turnstile|widget containing/i.test((f.src || '') + ' ' + (f.title || '')) && f.w >= 20 && f.h >= 20
+) || null;
+const sized = frames.find((f) => f.w >= 240 && f.w <= 400 && f.h >= 50 && f.h <= 90) || null;
+const hostSized = hosts.find((h) => h.w >= 100 && h.h >= 40) || hosts.find((h) => h.w >= 20 && h.h >= 20) || null;
+const collapsedOnly = !challenge && !sized && frames.some((f) => f.w > 0 && f.w <= 5 && f.h > 0 && f.h <= 5);
+const tokenLen = input ? String(input.value || '').trim().length : 0;
+return {
+  failure: !!failure,
+  collapsedOnly: !!collapsedOnly,
+  tokenLen,
+  hasInput: !!input,
+  hasApi: typeof turnstile !== 'undefined',
+  challenge,
+  sized,
+  hostSized,
+  hosts: hosts.slice(0, 6),
+  frames: frames.map((f) => ({
+    src: (f.src || '').slice(0, 140),
+    title: f.title,
+    w: f.w,
+    h: f.h,
+  })),
+};
+            """
+        ) or {}
+    except Exception as e:
+        return {"failure": False, "error": str(e)}
+
+
+def _iframe_box(iframe):
+    """取 iframe 在页面视口中的矩形。"""
+    try:
+        box = iframe.run_js(
+            """
+const r = this.getBoundingClientRect();
+return {x: r.left, y: r.top, w: r.width, h: r.height};
+            """
+        )
+        if box and float(box.get("w") or 0) > 0:
+            return box
+    except Exception:
+        pass
+    try:
+        rect = iframe.rect
+        if hasattr(rect, "location") and hasattr(rect, "size"):
+            return {
+                "x": float(rect.location[0]),
+                "y": float(rect.location[1]),
+                "w": float(rect.size[0]),
+                "h": float(rect.size[1]),
+            }
+        if hasattr(rect, "mid_x"):
+            w = float(getattr(rect, "width", 300) or 300)
+            h = float(getattr(rect, "height", 65) or 65)
+            return {
+                "x": float(rect.mid_x) - w / 2.0,
+                "y": float(rect.mid_y) - h / 2.0,
+                "w": w,
+                "h": h,
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _host_click_box():
+    """
+    当 shadow 内 iframe 缩成 1x1 时，改点宿主容器左侧（checkbox 区域）。
+    返回 {x,y,w,h} 或 None。
+    """
+    try:
+        box = page.run_js(
+            """
+const candidates = [];
+const push = (el, tag) => {
+  if (!el) return;
+  const r = el.getBoundingClientRect();
+  if (r.width >= 80 && r.height >= 40 && r.width <= 520 && r.height <= 120) {
+    candidates.push({ tag, x: r.left, y: r.top, w: r.width, h: r.height });
+  }
+};
+document.querySelectorAll('.cf-turnstile, [data-sitekey], div[id^="cf-"]').forEach((el) => push(el, 'host'));
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+if (input) {
+  let p = input.parentElement;
+  for (let i = 0; i < 6 && p; i++) {
+    push(p, 'input-parent-' + i);
+    p = p.parentElement;
+  }
+}
+// 取面积最大的合理宿主
+candidates.sort((a, b) => (b.w * b.h) - (a.w * a.h));
+return candidates[0] || null;
+            """
+        )
+        if box and float(box.get("w") or 0) >= 80:
+            return box
+    except Exception:
+        pass
+    return None
+
+
+def _locate_turnstile_click_target():
+    """
+    定位 Turnstile 复选框点击目标。
+    返回 (target, how)：
+      - target 可以是 iframe 元素，或 dict 坐标框 {x,y,w,h,kind:'box'}
+    跳过 failure feedback；兼容 1x1 collapsed iframe + 宿主容器点击。
+    collapsed 时优先宿主框（1x1 iframe 坐标点不中 checkbox）。
+    """
+    last_err = ""
+
+    # 路径 0：若已折叠为 1x1，优先宿主容器（避免点 1x1 iframe 中心）
+    try:
+        st0 = _turnstile_widget_state()
+        if st0.get("collapsedOnly") and st0.get("hostSized"):
+            host_box = _host_click_box()
+            if host_box:
+                host_box = dict(host_box)
+                host_box["kind"] = "box"
+                return host_box, "host-container-box-collapsed"
+    except Exception as e:
+        last_err = f"path0:{e}"
+
+    # 路径 A：从 hidden input 的父级 shadow 找 iframe
+    try:
+        challenge_solution = page.ele("@name=cf-turnstile-response", timeout=0.5)
+        if challenge_solution:
+            wrapper = challenge_solution.parent()
+            for _ in range(5):
+                if wrapper is None:
+                    break
+                try:
+                    sr = wrapper.shadow_root
+                    if sr:
+                        for iframe in sr.eles("tag:iframe", timeout=0.3) or []:
+                            try:
+                                src = (iframe.attr("src") or "") + " " + (iframe.attr("title") or "")
+                            except Exception:
+                                src = ""
+                            if "/failure" in src or "feedback report" in src.lower():
+                                continue
+                            box = _iframe_box(iframe)
+                            if box and float(box.get("w") or 0) >= 20 and float(box.get("h") or 0) >= 20:
+                                return iframe, "input-parent-shadow"
+                            # 1x1 也返回，调用方可用宿主框补点
+                            if box and float(box.get("w") or 0) > 0:
+                                return iframe, "input-parent-shadow-collapsed"
+                            if not box:
+                                return iframe, "input-parent-shadow"
+                except Exception as e:
+                    last_err = f"pathA-shadow:{e}"
+                try:
+                    wrapper = wrapper.parent()
+                except Exception:
+                    break
+    except Exception as e:
+        last_err = f"pathA:{e}"
+
+    # 路径 B：页面上 challenges.cloudflare.com 的非 failure iframe
+    try:
+        for iframe in page.eles("tag:iframe", timeout=0.5) or []:
+            try:
+                src = (iframe.attr("src") or "")
+                title = (iframe.attr("title") or "")
+            except Exception:
+                src, title = "", ""
+            blob = (src + " " + title).lower()
+            if "/failure" in blob or "feedback report" in blob:
+                continue
+            if "challenges.cloudflare.com" in blob or "turnstile" in blob or "widget containing" in blob:
+                box = _iframe_box(iframe)
+                if box and float(box.get("w") or 0) < 20:
+                    continue
+                return iframe, "direct-iframe"
+    except Exception as e:
+        last_err = f"pathB:{e}"
+
+    # 路径 C：.cf-turnstile / [data-sitekey] 容器内 iframe
+    for selector in (
+        "css:.cf-turnstile",
+        "css:[data-sitekey]",
+        "css:div[id^='cf-']",
+        "xpath://div[contains(@class,'cf-turnstile')]",
+    ):
+        try:
+            host = page.ele(selector, timeout=0.3)
+            if not host:
+                continue
+            try:
+                sr = host.shadow_root
+                if sr:
+                    iframe = sr.ele("tag:iframe", timeout=0.3)
+                    if iframe:
+                        box = _iframe_box(iframe)
+                        if box and float(box.get("w") or 0) >= 20:
+                            return iframe, f"host-shadow:{selector}"
+            except Exception:
+                pass
+            try:
+                iframe = host.ele("tag:iframe", timeout=0.2)
+                if iframe:
+                    return iframe, f"host-iframe:{selector}"
+            except Exception:
+                pass
+            # 无可用 iframe 时点宿主本身
+            try:
+                hb = host.run_js(
+                    "const r=this.getBoundingClientRect(); return {x:r.left,y:r.top,w:r.width,h:r.height};"
+                )
+                if hb and float(hb.get("w") or 0) >= 80 and float(hb.get("h") or 0) >= 40:
+                    hb = dict(hb)
+                    hb["kind"] = "box"
+                    return hb, f"host-box:{selector}"
+            except Exception:
+                pass
+        except Exception as e:
+            last_err = f"pathC:{selector}:{e}"
+
+    # 路径 D：按尺寸兜底（约 300x65 的 widget）
+    try:
+        for iframe in page.eles("tag:iframe", timeout=0.5) or []:
+            box = _iframe_box(iframe)
+            if not box:
+                continue
+            w, h = float(box.get("w") or 0), float(box.get("h") or 0)
+            if 240 <= w <= 400 and 50 <= h <= 90:
+                return iframe, "sized-widget"
+    except Exception as e:
+        last_err = f"pathD:{e}"
+
+    # 路径 E：宿主容器坐标（iframe 已 1x1 / closed shadow 时）
+    host_box = _host_click_box()
+    if host_box:
+        host_box = dict(host_box)
+        host_box["kind"] = "box"
+        return host_box, "host-container-box"
+
+    return None, last_err or "not-found"
+
+
+def _cdp_human_click(cx, cy):
+    """用 CDP 分步移动 + 按下/抬起，比 element.click() 更像真人。"""
+    steps = 12 + secrets.randbelow(8)
+    # 从附近随机起点移入
+    sx = cx - (40 + secrets.randbelow(80))
+    sy = cy - (20 + secrets.randbelow(40))
+    for i in range(1, steps + 1):
+        t = i / steps
+        # 轻微缓动
+        ease = t * t * (3 - 2 * t)
+        x = sx + (cx - sx) * ease + (secrets.randbelow(3) - 1)
+        y = sy + (cy - sy) * ease + (secrets.randbelow(3) - 1)
+        page.run_cdp(
+            "Input.dispatchMouseEvent",
+            type="mouseMoved",
+            x=float(x),
+            y=float(y),
+        )
+        time.sleep(0.008 + secrets.randbelow(12) / 1000.0)
+    time.sleep(0.05 + secrets.randbelow(12) / 100.0)
+    page.run_cdp(
+        "Input.dispatchMouseEvent",
+        type="mousePressed",
+        x=float(cx),
+        y=float(cy),
+        button="left",
+        buttons=1,
+        clickCount=1,
+    )
+    time.sleep(0.04 + secrets.randbelow(8) / 100.0)
+    page.run_cdp(
+        "Input.dispatchMouseEvent",
+        type="mouseReleased",
+        x=float(cx),
+        y=float(cy),
+        button="left",
+        buttons=0,
+        clickCount=1,
+    )
+
+
+def _click_turnstile_checkbox(target, prefer_cdp=True, how=""):
+    """
+    对 Turnstile 复选框点击。
+    target: iframe 元素 或 {x,y,w,h,kind:'box'} 宿主坐标框。
+    优先 CDP 坐标点击；iframe 缩成 1x1 时改点宿主左侧。
+    """
+    clicked = False
+    detail = []
+    iframe = None
+    box = None
+
+    if isinstance(target, dict) and target.get("kind") == "box":
+        box = target
+        detail.append("target=box")
+    else:
+        iframe = target
+        box = _iframe_box(iframe) if iframe is not None else None
+        # collapsed iframe：用宿主容器尺寸
+        if (not box) or float(box.get("w") or 0) < 20 or float(box.get("h") or 0) < 20 or "collapsed" in (how or ""):
+            host = _host_click_box()
+            if host:
+                box = host
+                detail.append("fallback-host-box")
+
+    if box:
+        w = float(box.get("w") or 300)
+        h = float(box.get("h") or 65)
+        # checkbox 在左侧；对超大 failure 面板不要点中心
+        if w > 420 or h > 200:
+            detail.append(f"skip-large:{int(w)}x{int(h)}")
+        else:
+            cx = float(box.get("x") or 0) + max(26.0, min(42.0, w * 0.12)) + (secrets.randbelow(5) - 2)
+            cy = float(box.get("y") or 0) + h * (0.45 + secrets.randbelow(10) / 100.0)
+
+            if prefer_cdp:
+                try:
+                    _cdp_human_click(cx, cy)
+                    clicked = True
+                    detail.append(f"cdp-human:{int(cx)},{int(cy)}")
+                except Exception as e:
+                    detail.append(f"cdp-human:{e}")
+
+            if not clicked:
+                try:
+                    page.actions.move_to((cx, cy))
+                    time.sleep(0.08 + secrets.randbelow(15) / 100.0)
+                    page.actions.click()
+                    clicked = True
+                    detail.append(f"actions:{int(cx)},{int(cy)}")
+                except Exception as e:
+                    detail.append(f"actions:{e}")
+
+    # 兜底：shadow 内 input（仅 iframe 可用时）
+    if not clicked and iframe is not None:
+        try:
+            body = iframe.ele("tag:body", timeout=0.6)
+            if body is not None:
+                sr = None
+                try:
+                    sr = body.shadow_root
+                except Exception:
+                    sr = None
+                btn = None
+                if sr:
+                    btn = (
+                        sr.ele("tag:input", timeout=0.3)
+                        or sr.ele("css:input[type=checkbox]", timeout=0.2)
+                        or sr.ele("css:[role=checkbox]", timeout=0.2)
+                    )
+                if btn is None:
+                    btn = body.ele("tag:input", timeout=0.2)
+                if btn is not None:
+                    try:
+                        btn.click(by_js=False)
+                    except Exception:
+                        btn.click()
+                    clicked = True
+                    detail.append("shadow-input")
+        except Exception as e:
+            detail.append(f"shadow:{e}")
+
+    if not clicked and iframe is not None:
+        try:
+            iframe.click()
+            clicked = True
+            detail.append("iframe-click")
+        except Exception as e:
+            detail.append(f"iframe-click:{e}")
+
+    return clicked, ",".join(detail)
+
+
+def _soft_reset_turnstile():
+    """Reset Turnstile; try mild host uncollapse when iframe is 1x1."""
+    try:
+        page.run_js(
+            """
+try { if (typeof turnstile !== 'undefined') turnstile.reset(); } catch (e) {}
+// Nudge collapsed hosts: force size on 1x1 iframes under turnstile parents
+try {
+  const hosts = document.querySelectorAll(
+    '.cf-turnstile, [data-sitekey], div[id^="cf-"], input[name="cf-turnstile-response"]'
+  );
+  hosts.forEach((el) => {
+    const root = el.name === 'cf-turnstile-response' ? (el.parentElement || el) : el;
+    if (!root) return;
+    try {
+      root.style.minWidth = root.style.minWidth || '300px';
+      root.style.minHeight = root.style.minHeight || '65px';
+      root.style.opacity = '1';
+      root.style.visibility = 'visible';
+    } catch (e0) {}
+    try {
+      root.querySelectorAll('iframe').forEach((f) => {
+        const r = f.getBoundingClientRect();
+        if (r.width > 0 && r.width <= 5 && r.height > 0 && r.height <= 5) {
+          f.style.width = '300px';
+          f.style.height = '65px';
+        }
+      });
+    } catch (e1) {}
+  });
+} catch (e) {}
+// Re-execute if API exposes widget ids
+try {
+  if (typeof turnstile !== 'undefined' && typeof turnstile.execute === 'function') {
+    try { turnstile.execute(); } catch (e2) {}
+  }
+} catch (e) {}
+return true;
+            """
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _load_register_interval_min() -> int:
+    """轮次间隔档位。
+
+    config: register_interval_min / registerIntervalMin
+    0 = 不等待；1～60 = 固定分钟；61 = 随机 25～50 分钟。默认 1。
+    """
+    try:
+        import json as _j
+        conf_path = os.path.join(os.path.dirname(__file__), "config.json")
+        if not os.path.isfile(conf_path):
+            return 1
+        with open(conf_path, "r", encoding="utf-8") as f:
+            conf = _j.load(f) or {}
+        raw = conf.get("register_interval_min")
+        if raw is None:
+            raw = conf.get("registerIntervalMin")
+        n = int(raw) if raw is not None and str(raw).strip() != "" else 1
+    except Exception:
+        n = 1
+    return max(0, min(61, n))
+
+
+def _resolve_register_interval_sec(iv_min=None):
+    """返回 (sleep_sec, log_label)。61 = 随机 25～50 分钟。"""
+    if iv_min is None:
+        try:
+            iv_min = _load_register_interval_min()
+        except Exception:
+            iv_min = 1
+    n = max(0, min(61, int(iv_min or 0)))
+    if n <= 0:
+        return 0, "0 分钟（不等待）"
+    if n >= 61:
+        import random as _rnd
+        pick = _rnd.randint(25, 50)
+        return pick * 60, f"随机 {pick} 分钟（区间 25～50）"
+    return n * 60, f"{n} 分钟"
+
+
+def _load_turnstile_auto_wait_max() -> int:
+    """
+    从 config.json 读取 Turnstile 自动通过等待上限（秒）。
+    实际等待在 [30, max] 内随机；缺省 max=60。
+    """
+    default_max = 60
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    try:
+        import json
+        with open(config_path, "r", encoding="utf-8") as f:
+            conf = json.load(f)
+        # 支持 turnstile.auto_wait_max 或顶层 turnstile_auto_wait_max
+        raw = None
+        if isinstance(conf.get("turnstile"), dict):
+            raw = conf["turnstile"].get("auto_wait_max")
+        if raw is None:
+            raw = conf.get("turnstile_auto_wait_max")
+        v = int(raw) if raw is not None else default_max
+        if v < 30:
+            v = 30
+        if v > 180:
+            v = 180
+        return v
+    except Exception:
+        return default_max
+
+
+def _pick_turnstile_auto_wait_secs(timeout: float) -> float:
+    """在 [30, configured_max] 内随机，且不超过本次 getTurnstileToken 的总 timeout-5。"""
+    configured_max = _load_turnstile_auto_wait_max()
+    lo = 30
+    hi = max(lo, configured_max)
+    # secrets.randbelow(n) → [0, n)
+    span = hi - lo + 1
+    picked = lo + secrets.randbelow(span)
+    # 不能把整个 timeout 吃光，至少给点击阶段留 5s
+    cap = max(0.0, float(timeout) - 5.0)
+    return float(min(picked, cap)) if cap > 0 else 0.0
+
+
+def _scroll_turnstile_into_view() -> None:
+    """把 Turnstile 宿主滚进视口，避免点到错误坐标。"""
+    try:
+        page.run_js(
+            """
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+const host = document.querySelector('.cf-turnstile, [data-sitekey]')
+  || (input && input.parentElement);
+if (host && host.scrollIntoView) {
+  host.scrollIntoView({ block: 'center', inline: 'nearest' });
+  return true;
+}
+return false;
+            """
+        )
+    except Exception:
+        pass
+
+
+
+def _try_turnstile_shadow_click_main2() -> bool:
+    """对齐 grok-register-main-2：shadow_root iframe → body.shadow_root input 点击。
+
+    不依赖 CDP 宿主框坐标；对 turnstilePatch 扩展更友好。
+    会遍历全部 cf-turnstile-response（原生 + hybrid inject）。
+    """
+    if page is None:
+        return False
+    try:
+        # 已有 token 则不必点
+        tok = _read_turnstile_token()
+        if tok:
+            return True
+    except Exception:
+        pass
+
+    candidates = []
+    try:
+        found = page.eles("@name=cf-turnstile-response", timeout=0.4) or []
+        candidates.extend(list(found))
+    except Exception:
+        pass
+    if not candidates:
+        try:
+            one = page.ele("@name=cf-turnstile-response", timeout=0.3)
+            if one:
+                candidates.append(one)
+        except Exception:
+            pass
+    # hybrid inject host 也可能直接挂 iframe
+    try:
+        host = page.ele("#hybrid-turnstile-host", timeout=0.2) or page.ele(
+            "css:.cf-turnstile", timeout=0.2
+        )
+        if host is not None:
+            candidates.append(host)
+    except Exception:
+        pass
+
+    for node in candidates:
+        try:
+            if node is None:
+                continue
+            wrapper = None
+            try:
+                name = ""
+                try:
+                    name = str(node.attr("name") or "")
+                except Exception:
+                    name = ""
+                wrapper = node.parent() if name == "cf-turnstile-response" else node
+            except Exception:
+                wrapper = node
+            if wrapper is None:
+                continue
+            iframe = None
+            try:
+                sr = getattr(wrapper, "shadow_root", None)
+                if sr is not None:
+                    iframe = sr.ele("tag:iframe", timeout=0.5)
+            except Exception:
+                iframe = None
+            if iframe is None:
+                try:
+                    iframe = wrapper.ele("tag:iframe", timeout=0.3)
+                except Exception:
+                    iframe = None
+            if iframe is None:
+                continue
+            try:
+                # 勿写死 screenX/Y value（turnstilePatch 用动态 getter；固定 value 更像机器人）
+                iframe.run_js(
+                    """
+window.dtp = 1;
+try {
+  const sx = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'screenX');
+  if (!sx || !sx.get) {
+    const ox = Math.floor(Math.random()*100)+40;
+    const oy = Math.floor(Math.random()*80)+80;
+    Object.defineProperty(MouseEvent.prototype, 'screenX', {
+      get: function(){ return (this.clientX||0)+(window.screenX||0)+ox; },
+      configurable: true
+    });
+    Object.defineProperty(MouseEvent.prototype, 'screenY', {
+      get: function(){ return (this.clientY||0)+(window.screenY||0)+oy; },
+      configurable: true
+    });
+  }
+} catch (e) {}
+"""
+                )
+            except Exception:
+                pass
+            try:
+                body = iframe.ele("tag:body", timeout=0.8)
+                if body is None:
+                    continue
+                body_sr = getattr(body, "shadow_root", None)
+                if body_sr is None:
+                    continue
+                btn = (
+                    body_sr.ele("tag:input", timeout=0.5)
+                    or body_sr.ele("css:input[type=checkbox]", timeout=0.3)
+                    or body_sr.ele("css:[role=checkbox]", timeout=0.3)
+                )
+                if btn:
+                    try:
+                        btn.click(by_js=False)
+                    except Exception:
+                        btn.click()
+                    print("[*] Turnstile main2-shadow click ok", flush=True)
+                    return True
+            except Exception as e:
+                print(f"[Debug] main2-shadow click: {e}", flush=True)
+                continue
+        except Exception as e:
+            print(f"[Debug] main2-shadow path: {e}", flush=True)
+            continue
+    return False
+
+def getTurnstileToken(timeout=50, log_callback=None, *, fast=False, auto_wait_cap=None):
+    """
+    求解最终注册页 Turnstile。
+    优先长等自动通过；若控件长期 1x1 折叠则中途 soft reset + 宿主框点击。
+    折叠态：缩短 auto-wait 并尽早进入宿主框点击。
+
+    fast=True（P0.5 重试短路径）：跳过 30–60s 随机自动等待，soft reset 后
+    立刻进入宿主框点击（AA #19d2170b：第二次 get 又烧一整段 auto-wait）。
+    auto_wait_cap：可选硬上限（秒），覆盖随机 auto-wait 的上限。
+    """
+    _ = log_callback  # optional; hybrid passes log_callback=
+    refresh_active_page()
+    _apply_stealth_patches(page)
+    _scroll_turnstile_into_view()
+    deadline = time.time() + max(8.0, float(timeout or 50))
+    last_diag = ""
+    click_attempts = 0
+    reset_count = 0
+    mid_reset_done = False
+    max_clicks = 3
+    collapsed_mid_resets = 0
+
+    # 自动通过：正常 30~n；fast / auto_wait_cap 限制
+    if fast:
+        auto_wait_secs = min(3.0, max(1.0, float(timeout or 50) * 0.08))
+        print(
+            f"[*] Turnstile 短路径 fast=1：auto-wait≤{auto_wait_secs:.0f}s，"
+            f"soft reset 后尽快宿主框点击…"
+        )
+        try:
+            _soft_reset_turnstile()
+            reset_count += 1
+            time.sleep(0.8 + secrets.randbelow(8) / 10.0)
+            _scroll_turnstile_into_view()
+        except Exception:
+            pass
+    else:
+        auto_wait_secs = _pick_turnstile_auto_wait_secs(timeout)
+        if auto_wait_cap is not None:
+            try:
+                auto_wait_secs = min(auto_wait_secs, max(0.0, float(auto_wait_cap)))
+            except Exception:
+                pass
+        print(
+            f"[*] Turnstile 自动通过等待最长 {auto_wait_secs:.0f}s "
+            f"（区间 30~{_load_turnstile_auto_wait_max()}s 随机）…"
+        )
+    auto_wait_until = time.time() + auto_wait_secs
+    auto_start = time.time()
+    while time.time() < auto_wait_until:
+        token = _read_turnstile_token()
+        if token:
+            print("[*] Turnstile 已自动通过（无需点击）。")
+            return token
+        state = _turnstile_widget_state()
+        if state.get("failure"):
+            print("[Warn] 自动等待阶段检测到 Turnstile failure 反馈页。")
+            break
+        elapsed = time.time() - auto_start
+        # main-2 风格：优先 shadow checkbox（比 soft reset 温和）
+        if elapsed >= 2 and int(elapsed) % 3 == 0 and not state.get("failure"):
+            try:
+                if _try_turnstile_shadow_click_main2():
+                    time.sleep(1.0)
+                    tok = _read_turnstile_token()
+                    if tok:
+                        print("[*] Turnstile main2-shadow 点击后已出 token。")
+                        return tok
+            except Exception:
+                pass
+        if (
+            elapsed >= 8
+            and state.get("collapsedOnly")
+            and state.get("hostSized")
+            and not state.get("failure")
+            and reset_count < 2
+            and (not mid_reset_done or elapsed >= 14)
+        ):
+            print("[*] 自动等待中控件仍 1x1，执行 mid soft reset…")
+            _soft_reset_turnstile()
+            mid_reset_done = True
+            reset_count += 1
+            collapsed_mid_resets += 1
+            time.sleep(1.2 + secrets.randbelow(10) / 10.0)
+            _scroll_turnstile_into_view()
+            peek_end = time.time() + min(3.0, auto_wait_until - time.time())
+            while time.time() < peek_end:
+                tok = _read_turnstile_token()
+                if tok:
+                    print("[*] mid soft reset 后 Turnstile 已自动通过。")
+                    return tok
+                st2 = _turnstile_widget_state()
+                if st2.get("challenge") or st2.get("sized"):
+                    break
+                time.sleep(0.3)
+            # 两次 mid 仍 1x1：提前进点击（别把 30–60s 烧完）
+            if collapsed_mid_resets >= 2 and elapsed >= 10:
+                print("[*] 1x1 持续折叠，提前结束自动等待 → 宿主框点击阶段。")
+                break
+            continue
+        if state.get("challenge") or state.get("sized"):
+            print("[*] 检测到可交互 Turnstile 控件，进入点击阶段。")
+            break
+        time.sleep(0.4)
+
+    while time.time() < deadline:
+        token = _read_turnstile_token()
+        if token:
+            print("[*] Turnstile token 已获取。")
+            return token
+
+        state = _turnstile_widget_state()
+        # 折叠态多给几次点击机会（host 有尺寸时仍可能出 token）
+        if state.get("collapsedOnly"):
+            max_clicks = 8 if state.get("hostSized") else 6
+
+        if state.get("failure"):
+            last_diag = f"failure-state frames={state.get('frames')}"
+            # fail-fast: CF failure 反馈页几乎不可靠连点恢复；最多 1 次 soft reset + 短等
+            if reset_count < 1 and time.time() + 4 < deadline:
+                print("[*] 检测到 Turnstile failure，执行 soft reset（最多 1 次，随后 fail-fast）。")
+                _soft_reset_turnstile()
+                reset_count += 1
+                wait_end = time.time() + min(3.5, deadline - time.time())
+                while time.time() < wait_end:
+                    token = _read_turnstile_token()
+                    if token:
+                        print("[*] Turnstile soft reset 后已自动通过。")
+                        return token
+                    if _turnstile_widget_state().get("failure"):
+                        break
+                    time.sleep(0.35)
+                # 仍 failure → 直接退出，禁止继续 CDP 连点刷屏
+            print("[Debug] Turnstile 已被 Cloudflare 判定 failure，停止连点。")
+            break
+
+        if click_attempts >= max_clicks:
+            last_diag = f"max-clicks:{click_attempts}"
+            # 最后一次 reset 后再等一小段，避免直接放弃
+            if reset_count < 2 and time.time() + 5 < deadline:
+                print("[*] 点击次数用尽，最后 soft reset 并短等…")
+                _soft_reset_turnstile()
+                reset_count += 1
+                click_attempts = max(0, max_clicks - 1)  # 允许再点 1 次
+                wait_end = time.time() + min(5, deadline - time.time())
+                while time.time() < wait_end:
+                    token = _read_turnstile_token()
+                    if token:
+                        print("[*] 最终 soft reset 后已自动通过。")
+                        return token
+                    time.sleep(0.4)
+                continue
+            break
+
+        target, how = _locate_turnstile_click_target()
+        if target is None:
+            last_diag = f"locate-fail:{how} state={state}"
+            # 纯 1x1（无 hostSized 可点框）= CF 拒渲染 challenge，无任何点击目标。
+            # 这种环境失败连点/多次 reset 纯烧时间；1 次 soft reset 仍无目标即 fail-fast，
+            # 让本轮快速轮转到下一个 IP，而不是空耗 deadline。
+            # hostSized 折叠态另有实测出 token 的可能，仍保留 2 次 reset。
+            pure_1x1 = state.get("collapsedOnly") and not state.get("hostSized")
+            reset_cap = 1 if pure_1x1 else 2
+            if state.get("collapsedOnly") and reset_count < reset_cap and time.time() + 8 < deadline:
+                print("[*] Turnstile 控件折叠为 1x1，soft reset 一次。")
+                _soft_reset_turnstile()
+                reset_count += 1
+                wait_end = time.time() + min(6, deadline - time.time())
+                while time.time() < wait_end:
+                    token = _read_turnstile_token()
+                    if token:
+                        print("[*] Turnstile soft reset 后已自动通过。")
+                        return token
+                    time.sleep(0.4)
+                continue
+            if pure_1x1:
+                last_diag = f"pure-1x1-fail-fast reset={reset_count} state={state}"
+                print("[*] Turnstile 纯 1x1 无可点目标，soft reset 后仍折叠 → fail-fast 跳过本轮。")
+                break
+            time.sleep(0.6)
+            continue
+
+        if click_attempts == 0:
+            print(f"[*] 已定位 Turnstile ({how})，CDP 点击（最多 {max_clicks} 次）。")
+
+        _scroll_turnstile_into_view()
+        time.sleep(0.15 + secrets.randbelow(25) / 100.0)
+        clicked, detail = _click_turnstile_checkbox(target, prefer_cdp=True, how=how)
+        click_attempts += 1
+        last_diag = f"click#{click_attempts} via={how} detail={detail} ok={clicked}"
+        print(f"[*] Turnstile 点击尝试 #{click_attempts}: {detail}")
+
+        # 点击后等待：折叠态更长，给 token 生成时间（1x1 host 点中后常 3–12s 才出）
+        wait_slice = min(12.0 if state.get("collapsedOnly") else 5.5, max(2.5, deadline - time.time()))
+        wait_end = time.time() + wait_slice
+        while time.time() < wait_end:
+            token = _read_turnstile_token()
+            if token:
+                print(f"[*] Turnstile 点击后已出 token（第 {click_attempts} 次）。")
+                return token
+            st = _turnstile_widget_state()
+            if st.get("failure"):
+                print("[Warn] 点击后进入 Turnstile failure 状态。")
+                last_diag = f"post-click-failure #{click_attempts}"
+                break
+            time.sleep(0.3)
+
+        # 折叠态：同一次尝试内补点宿主左侧另一偏移（checkbox 横向漂移）
+        if (
+            state.get("collapsedOnly")
+            and state.get("hostSized")
+            and time.time() + 4 < deadline
+            and click_attempts < max_clicks
+        ):
+            try:
+                hb = _host_click_box()
+                if hb:
+                    w = float(hb.get("w") or 300)
+                    h = float(hb.get("h") or 65)
+                    # 第二偏移：略偏右/偏下（常见 checkbox 不在最左 12%）
+                    cx2 = float(hb.get("x") or 0) + max(30.0, min(55.0, w * 0.18)) + (
+                        secrets.randbelow(7) - 3
+                    )
+                    cy2 = float(hb.get("y") or 0) + h * (0.5 + secrets.randbelow(8) / 100.0)
+                    _scroll_turnstile_into_view()
+                    _cdp_human_click(cx2, cy2)
+                    print(
+                        f"[*] Turnstile 折叠态补点 host offset "
+                        f"#{click_attempts}b: {int(cx2)},{int(cy2)}"
+                    )
+                    peek2 = time.time() + min(6.0, deadline - time.time())
+                    while time.time() < peek2:
+                        token = _read_turnstile_token()
+                        if token:
+                            print(
+                                f"[*] Turnstile 补点后已出 token（第 {click_attempts} 次）。"
+                            )
+                            return token
+                        if _turnstile_widget_state().get("failure"):
+                            break
+                        time.sleep(0.3)
+            except Exception as e:
+                print(f"[Debug] Turnstile host offset click: {e}")
+
+        time.sleep(0.2 + secrets.randbelow(20) / 100.0)
+
+    # 最终诊断（不立即 raise，先给外置 Solver 一次机会）
+    fail_msg = "failed to solve turnstile"
+    try:
+        diag = _turnstile_widget_state()
+        print(f"[Debug] Turnstile 失败诊断: {diag} | last={last_diag}")
+        if diag.get("failure"):
+            fail_msg = (
+                "failed to solve turnstile: Cloudflare 返回 failure 反馈页"
+                "（多为 IP 信誉/浏览器指纹/架构问题，而非单纯点不中）"
+            )
+        elif diag.get("collapsedOnly"):
+            fail_msg = (
+                "failed to solve turnstile: widget 折叠为 1x1 且无 token"
+                "（常见于 ARM 容器 / UA 与 Chromium 版本错配 / 代理 IP 信誉偏低）"
+            )
+    except Exception as e:
+        print(f"[Debug] Turnstile 失败诊断不可用: {e} | last={last_diag}")
+
+    # 外置 Solver 兜底（可选组件；必须在函数体内，禁止模块级 raise）
+    try:
+        from turnstile_solver_client import solve_turnstile, solver_enabled, yescaptcha_key
+
+        if solver_enabled() or yescaptcha_key():
+            print("[*] Turnstile page miss → external solver…")
+            ext = solve_turnstile(
+                siteurl="https://accounts.x.ai/sign-up",
+                sitekey="",
+                max_wait=90,
+                log=lambda m: print(m),
+            )
+            if ext and len(str(ext)) >= 80:
+                try:
+                    _inject_turnstile_token(str(ext))
+                except Exception:
+                    pass
+                print(f"[*] Turnstile external token len={len(ext)}")
+                return str(ext)
+    except Exception as ee:
+        print(f"[Debug] external turnstile: {ee}")
+
+    raise Exception(fail_msg)
+
+
+_GIVEN_NAMES = [
+    "Aaron", "Adam", "Adrian", "Alan", "Albert", "Alex", "Alice", "Allen",
+    "Amy", "Andrew", "Angela", "Anna", "Anthony", "Ashley", "Austin", "Bella",
+    "Benjamin", "Bradley", "Brandon", "Brian", "Caleb", "Cameron", "Carl",
+    "Carol", "Charles", "Chloe", "Chris", "Claire", "Cody", "Connor", "Daniel",
+    "David", "Dean", "Dennis", "Derek", "Diana", "Donald", "Doris", "Douglas",
+    "Dylan", "Edward", "Elaine", "Eli", "Elijah", "Ella", "Emily", "Eric",
+    "Ethan", "Eva", "Evan", "Felix", "Frank", "Gabriel", "Gary", "George",
+    "Grace", "Grant", "Gregory", "Hannah", "Harold", "Harry", "Henry", "Ian",
+    "Isaac", "Ivan", "Jack", "Jacob", "James", "Jane", "Jason", "Jay",
+    "Jeffrey", "Jennifer", "Jeremy", "Jessica", "John", "Jonathan", "Jordan",
+    "Joseph", "Joshua", "Julia", "Justin", "Karen", "Kate", "Keith", "Kelly",
+    "Kenneth", "Kevin", "Kyle", "Larry", "Laura", "Lauren", "Leah", "Lee",
+    "Leo", "Linda", "Logan", "Louis", "Lucas", "Lucy", "Luke", "Mark",
+    "Martin", "Mary", "Mason", "Matthew", "Megan", "Melissa", "Michael",
+    "Mike", "Nancy", "Nathan", "Neo", "Nicholas", "Noah", "Olivia", "Oscar",
+    "Owen", "Patrick", "Paul", "Peter", "Philip", "Rachel", "Ralph", "Randy",
+    "Ray", "Rebecca", "Richard", "Robert", "Roger", "Ronald", "Rose", "Russell",
+    "Ryan", "Samantha", "Samuel", "Sandra", "Sarah", "Scott", "Sean", "Sharon",
+    "Shawn", "Sophia", "Stanley", "Stephen", "Steven", "Susan", "Thomas",
+    "Tim", "Travis", "Tyler", "Victor", "Victoria", "Vincent", "Walter",
+    "Wayne", "William", "Wyatt", "Zachary", "Zoey",
+]
+
+_FAMILY_NAMES = [
+    "Adams", "Allen", "Anderson", "Bailey", "Baker", "Barnes", "Bell",
+    "Bennett", "Brooks", "Brown", "Bryant", "Butler", "Campbell", "Carter",
+    "Chen", "Clark", "Coleman", "Collins", "Cook", "Cooper", "Cox", "Cruz",
+    "Davis", "Diaz", "Edwards", "Evans", "Fisher", "Flores", "Foster",
+    "Garcia", "Gomez", "Gonzalez", "Gray", "Green", "Hall", "Harris",
+    "Hayes", "Henderson", "Hernandez", "Hill", "Holmes", "Howard", "Hughes",
+    "Hunter", "Jackson", "James", "Jenkins", "Johnson", "Jones", "Kelly",
+    "Khan", "Kim", "King", "Lee", "Lewis", "Lin", "Long", "Lopez", "Martin",
+    "Martinez", "Miller", "Mitchell", "Moore", "Morales", "Morgan", "Morris",
+    "Murphy", "Murray", "Nelson", "Nguyen", "Owens", "Parker", "Patel",
+    "Perez", "Peterson", "Phillips", "Powell", "Price", "Ramirez", "Reed",
+    "Reyes", "Richardson", "Rivera", "Roberts", "Robinson", "Rodriguez",
+    "Rogers", "Ross", "Russell", "Sanchez", "Sanders", "Scott", "Simmons",
+    "Smith", "Stewart", "Sullivan", "Taylor", "Thomas", "Thompson", "Torres",
+    "Turner", "Walker", "Wang", "Ward", "Watson", "White", "Williams",
+    "Wilson", "Wood", "Wright", "Young", "Zhang", "Zhou",
+]
+
+
+def build_profile():
+    # 生成一组可重复使用的注册资料，姓名从英文常见姓名表里随机抽取，
+    # 密码至少包含大小写、数字和特殊字符。
+    given_name = secrets.choice(_GIVEN_NAMES)
+    family_name = secrets.choice(_FAMILY_NAMES)
+    password = "N" + secrets.token_hex(4) + "!a7#" + secrets.token_urlsafe(6)
+    return given_name, family_name, password
+
+
+def fill_profile_and_submit(timeout=None, *, mode: str = "a"):
+    # 覆盖 Turnstile 自动通过（30~n 秒随机）+ 短点击 + 表单填写。
+    # timeout 默认随 config turnstile.auto_wait_max 放宽。
+    # mode="b"：Plan B —— 先等自然成功证据，再 simulate 点击（FlowPilot 思路）
+    plan_b = str(mode or "a").lower() in ("b", "plan_b", "plan-b", "2")
+    if timeout is None:
+        base = float(_load_turnstile_auto_wait_max() + 30)
+        timeout = base + (45 if plan_b else 0)
+
+    given_name, family_name, password = build_profile()
+    deadline = time.time() + timeout
+    turnstile_token = ""
+    turnstile_attempted = False
+
+    pure_ab = False
+    try:
+        pure_ab = _pure_browser_mode() and not plan_b
+    except Exception:
+        pure_ab = False
+    if pure_ab:
+        print("[pure] 资料页：加长拟人停顿 + 指针游走", flush=True)
+        _pure_browser_pause(900, 2200)
+        _pure_browser_mouse_wander(10)
+
+    if plan_b:
+        print("[plan-b] 资料页：拟人延迟 + 等人机成功证据后再提交")
+        try:
+            from plan_b import detect_cf_security_block, human_pause, human_pause_major
+
+            blk = detect_cf_security_block(page)
+            if blk:
+                raise Exception(f"CF 安全拦截({blk})，Plan B 放弃")
+            human_pause_major(800, 1600)
+        except Exception as e:
+            if "CF 安全拦截" in str(e):
+                raise
+            print(f"[plan-b] 预检跳过: {e}")
+
+    while time.time() < deadline:
+        filled = page.run_js(
+            """
+const givenName = arguments[0];
+const familyName = arguments[1];
+const password = arguments[2];
+
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function pickInput(selector) {
+    return Array.from(document.querySelectorAll(selector)).find((node) => {
+        return isVisible(node) && !node.disabled && !node.readOnly;
+    }) || null;
+}
+
+function setInputValue(input, value) {
+    if (!input) {
+        return false;
+    }
+    input.focus();
+    input.click();
+
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const tracker = input._valueTracker;
+    if (tracker) {
+        tracker.setValue('');
+    }
+
+    if (nativeSetter) {
+        nativeSetter.call(input, '');
+        nativeSetter.call(input, value);
+    } else {
+        input.value = '';
+        input.value = value;
+    }
+
+    input.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.dispatchEvent(new Event('blur', { bubbles: true }));
+
+    return String(input.value || '') === String(value || '');
+}
+
+const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
+const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
+const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
+
+if (!givenInput || !familyInput || !passwordInput) {
+    return 'not-ready';
+}
+
+const givenOk = setInputValue(givenInput, givenName);
+const familyOk = setInputValue(familyInput, familyName);
+const passwordOk = setInputValue(passwordInput, password);
+
+if (!givenOk || !familyOk || !passwordOk) {
+    return 'filled-failed';
+}
+
+return [
+    String(givenInput.value || '').trim() === String(givenName || '').trim(),
+    String(familyInput.value || '').trim() === String(familyName || '').trim(),
+    String(passwordInput.value || '') === String(password || ''),
+].every(Boolean) ? 'filled' : 'verify-failed';
+            """,
+            given_name,
+            family_name,
+            password,
+        )
+
+        if filled == 'not-ready':
+            if plan_b:
+                try:
+                    from plan_b import detect_cf_security_block, human_pause
+
+                    blk = detect_cf_security_block(page)
+                    if blk:
+                        raise Exception(f"CF 安全拦截({blk})，Plan B 放弃")
+                    human_pause(300, 900)
+                except Exception as e:
+                    if "CF 安全拦截" in str(e):
+                        raise
+            time.sleep(0.5)
+            continue
+
+        if filled != 'filled':
+            print(f"[Debug] 最终注册页输入框已出现，但姓名/密码写入失败: {filled}")
+            time.sleep(0.5)
+            continue
+
+        values_ok = page.run_js(
+            """
+const expectedGiven = arguments[0];
+const expectedFamily = arguments[1];
+const expectedPassword = arguments[2];
+
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function pickInput(selector) {
+    return Array.from(document.querySelectorAll(selector)).find((node) => {
+        return isVisible(node) && !node.disabled && !node.readOnly;
+    }) || null;
+}
+
+const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
+const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
+const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
+
+if (!givenInput || !familyInput || !passwordInput) {
+    return false;
+}
+
+return String(givenInput.value || '').trim() === String(expectedGiven || '').trim()
+    && String(familyInput.value || '').trim() === String(expectedFamily || '').trim()
+    && String(passwordInput.value || '') === String(expectedPassword || '');
+            """,
+            given_name,
+            family_name,
+            password,
+        )
+        if not values_ok:
+            print("[Debug] 最终注册页字段值校验失败，继续重试填写。")
+            time.sleep(0.5)
+            continue
+
+        if pure_ab:
+            _pure_browser_pause(500, 1400)
+            _pure_browser_mouse_wander(7)
+            # 逐字段再 CDP 轻触焦点（行为流），不改值
+            try:
+                for sel in (
+                    'input[name="givenName"], input[autocomplete="given-name"]',
+                    'input[name="familyName"], input[autocomplete="family-name"]',
+                    'input[name="password"], input[type="password"]',
+                ):
+                    box = page.run_js(
+                        """
+const n=document.querySelector(arguments[0]);
+if(!n) return null;
+const r=n.getBoundingClientRect();
+if(r.width<=0) return null;
+n.focus();
+return {x:r.x+r.width/2,y:r.y+r.height/2};
+""",
+                        sel,
+                    )
+                    if isinstance(box, dict):
+                        try:
+                            _cdp_human_click(float(box["x"]), float(box["y"]))
+                        except Exception:
+                            pass
+                        time.sleep(0.15 + secrets.randbelow(25) / 100.0)
+            except Exception:
+                pass
+            _pure_browser_pause(400, 1100)
+
+        turnstile_state = page.run_js(
+            """
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!challengeInput) {
+    return 'not-found';
+}
+const value = String(challengeInput.value || '').trim();
+return value ? 'ready' : 'pending';
+            """
+        )
+
+        # ── Plan B：先等自然成功证据，再模拟点击；失败再回落到 getTurnstileToken ──
+        if plan_b and not turnstile_attempted:
+            turnstile_attempted = True
+            try:
+                from plan_b import wait_turnstile_success, human_pause
+
+                remain = max(20.0, min(45.0, deadline - time.time() - 5))
+                print(f"[plan-b] 等待 Turnstile 成功证据（最长 {int(remain)}s）…")
+                ev = wait_turnstile_success(page, timeout=remain, log=lambda m: print(m))
+                if isinstance(ev, dict) and ev.get("failure"):
+                    raise Exception(
+                        "failed to solve turnstile: Cloudflare 返回 failure 反馈页"
+                        "（多为 IP 信誉/浏览器指纹/架构问题，而非单纯点不中）"
+                    )
+                if not ev.get("ok"):
+                    print("[plan-b] 自然成功证据超时，尝试 getTurnstileToken 兜底…")
+                else:
+                    print(f"[plan-b] 人机证据就绪 type={ev.get('type')}")
+                human_pause(400, 1000)
+            except Exception as e:
+                print(f"[plan-b] wait_turnstile: {e}")
+
+        if turnstile_state == "pending" and not turnstile_token:
+            if turnstile_attempted and not plan_b:
+                remain = max(5, deadline - time.time() - 3)
+            else:
+                # 自动通过上限 n（默认 60，WebUI 可配）+ 点击缓冲；总预算随 n 放宽
+                auto_max = _load_turnstile_auto_wait_max()
+                remain = max(auto_max + 15, min(auto_max + 25, deadline - time.time() - 3))
+            if not plan_b or not turnstile_token:
+                print("[*] 检测到最终注册页存在 Turnstile，优先等待自动通过。")
+                turnstile_attempted = True
+                turnstile_token = getTurnstileToken(timeout=remain)
+                if turnstile_token:
+                    if _inject_turnstile_token(turnstile_token):
+                        print("[*] Turnstile 响应已同步到最终注册表单。")
+
+        # P1：提交前若 token 被清空/卡住，二次复用已有 token 或再取一次
+        if turnstile_state == "pending" or turnstile_state == "not-found":
+            pass
+        else:
+            # ready 时也校验页面是否仍持有 token
+            cur = _read_turnstile_token()
+            if cur:
+                turnstile_token = cur
+        if not _read_turnstile_token() and turnstile_token:
+            print("[*] 页面 Turnstile token 丢失，二次注入已有 token…")
+            _inject_turnstile_token(turnstile_token)
+        elif not _read_turnstile_token() and time.time() + 8 < deadline:
+            # 卡住：soft reset + 再取一次
+            print("[*] 提交前 Turnstile 仍空，soft reset 后二次获取…")
+            try:
+                _soft_reset_turnstile()
+            except Exception:
+                pass
+            extra = getTurnstileToken(timeout=min(25, max(8, deadline - time.time() - 2)))
+            if extra:
+                turnstile_token = extra
+                _inject_turnstile_token(extra)
+                print("[*] Turnstile 二次复用完成。")
+
+        if pure_ab:
+            _pure_browser_pause(700, 1800)
+            _pure_browser_mouse_wander(8)
+        else:
+            time.sleep(0.6 if not plan_b else 0.9)
+
+        clicked = False
+        if plan_b:
+            try:
+                from plan_b import simulate_submit_click, human_pause
+
+                human_pause(200, 600)
+                r = simulate_submit_click(page)
+                clicked = bool(r.get("ok"))
+                if clicked:
+                    print(f"[plan-b] 模拟点击提交: {r.get('text') or 'ok'}")
+                elif r.get("reason") == "turnstile-empty":
+                    print("[plan-b] 人机 token 仍空，暂不提交")
+            except Exception as e:
+                print(f"[plan-b] simulate_click 失败: {e}")
+                clicked = False
+
+        if not clicked:
+            nav_ok = False
+            try:
+                submit_button = page.ele('tag:button@@text()=完成注册') or page.ele('tag:button@@text():Create Account') or page.ele('tag:button@@text():Sign up')
+            except Exception as e:
+                submit_button = None
+                em = str(e)
+                # 导航中途 Drission 抛「页面已被刷新」——常见于点完完成注册后
+                if "刷新" in em or "disconnected" in em.lower() or "连接已断开" in em:
+                    nav_ok = True
+                    print(f"[*] 提交阶段页面导航中（{em[:80]}），按已提交处理")
+
+            if nav_ok:
+                clicked = True
+            elif not submit_button:
+                try:
+                    clicked = page.run_js(
+                        r"""
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (challengeInput && !String(challengeInput.value || '').trim()) {
+    return false;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+const submitButton = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
+    const t = text.toLowerCase(); return text === '完成注册' || text.includes('完成注册') || t.includes('create account') || t.includes('sign up') || t.includes('complete');
+});
+if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-disabled') === 'true') {
+    return false;
+}
+submitButton.focus();
+submitButton.click();
+return true;
+                        """
+                    )
+                except Exception as e:
+                    em = str(e)
+                    if "刷新" in em or "disconnected" in em.lower() or "连接已断开" in em:
+                        clicked = True
+                        print(f"[*] JS 提交触发导航（{em[:80]}），按已提交处理")
+                    else:
+                        clicked = False
+            else:
+                try:
+                    challenge_value = page.run_js(
+                        """
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
+                        """
+                    )
+                    if challenge_value not in ('not-found', ''):
+                        submit_button.click()
+                        clicked = True
+                    else:
+                        clicked = False
+                except Exception as e:
+                    em = str(e)
+                    if "刷新" in em or "disconnected" in em.lower() or "连接已断开" in em:
+                        clicked = True
+                        print(f"[*] 点击完成注册后页面已跳转（{em[:80]}）")
+                    else:
+                        clicked = False
+
+        if clicked:
+            tag = "plan-b" if plan_b else "*"
+            print(f"[{tag}] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
+            # 给导航一点时间，避免立刻读 cookie 撞断开
+            time.sleep(1.2)
+            return {
+                "given_name": given_name,
+                "family_name": family_name,
+                "password": password,
+                "plan": "b" if plan_b else "a",
+            }
+
+        time.sleep(0.5 if not plan_b else 0.8)
+
+    raise Exception("未找到最终注册表单或完成注册按钮")
+
+
+def extract_visible_numbers(timeout=60):
+    # 登录/注册完成后，提取页面上可见的普通数字文本，不处理任何敏感 Cookie。
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = page.run_js(
+            r"""
+function isVisible(el) {
+    if (!el) {
+        return false;
+    }
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const selector = [
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'div', 'span', 'p', 'strong', 'b', 'small',
+    '[data-testid]', '[class]', '[role="heading"]'
+].join(',');
+
+const seen = new Set();
+const matches = [];
+for (const node of document.querySelectorAll(selector)) {
+    if (!isVisible(node)) {
+        continue;
+    }
+    const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!text) {
+        continue;
+    }
+    const found = text.match(/\d+(?:\.\d+)?/g);
+    if (!found) {
+        continue;
+    }
+    for (const value of found) {
+        const key = `${value}@@${text}`;
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        matches.push({ value, text });
+    }
+}
+
+return matches.slice(0, 30);
+            """
+        )
+
+        if result:
+            print("[*] 页面可见数字文本提取结果:")
+            for item in result:
+                try:
+                    print(f"    - 数字: {item['value']} | 上下文: {item['text']}")
+                except Exception:
+                    pass
+            return result
+
+        time.sleep(1)
+
+    raise Exception("登录后未提取到可见数字文本")
+
+
+def wait_for_sso_cookie(timeout=30, prefer_domain: str = "grok.com"):
+    # 必须在注册完成后再取 sso，优先抓取 grok.com 域上的 sso 值。
+    # 历史背景：accounts.x.ai 域和 grok.com 域上都会出现一个名为 "sso" 的 cookie；
+    # grok2api 真正要用的是 grok.com 那一份（和 chat 接口同域），如果错拿了
+    # accounts.x.ai 那一份，下游调用会被风控秒拒。
+    deadline = time.time() + timeout
+    last_seen_names = set()
+    fallback_value = ""  # 拿不到 prefer_domain 上的，再退回任意域的 sso
+
+    def _scan_cookies(cookie_iter):
+        nonlocal fallback_value
+        for item in cookie_iter:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                value = str(item.get("value", "")).strip()
+                domain = str(item.get("domain", "")).strip().lstrip(".")
+            else:
+                name = str(getattr(item, "name", "")).strip()
+                value = str(getattr(item, "value", "")).strip()
+                domain = str(getattr(item, "domain", "")).strip().lstrip(".")
+            if name:
+                last_seen_names.add(f"{name}@{domain}" if domain else name)
+            if name == "sso" and value:
+                if prefer_domain and prefer_domain in domain:
+                    return ("preferred", domain, value)
+                if not fallback_value:
+                    fallback_value = value
+        return None
+
+    while time.time() < deadline:
+        try:
+            # 不依赖单一 page 句柄——warm-up 期间 grok.com 里的 turnstile/广告 iframe
+            # 可能让 page 飘到不相关的标签页（比如 NID@google.com）。所以我们扫所有标签页：
+            # 优先在显式访问 grok.com 的标签页里找 sso；找不到再退回当前 page。
+            grok_tab = None
+            try:
+                if browser is not None:
+                    for tab in browser.get_tabs():
+                        try:
+                            url = (tab.url or "")
+                        except Exception:
+                            url = ""
+                        if "grok.com" in url:
+                            grok_tab = tab
+                            break
+            except Exception:
+                grok_tab = None
+
+            target = grok_tab or page
+            if target is None:
+                time.sleep(1)
+                continue
+
+            cookies = target.cookies(all_domains=True, all_info=True) or []
+            hit = _scan_cookies(cookies)
+            if hit:
+                _, domain, value = hit
+                print(f"[*] 已获取到 {domain} 域的 sso cookie。")
+                return value
+
+        except PageDisconnectedError:
+            refresh_active_page()
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    if fallback_value:
+        print(f"[Warn] 未拿到 {prefer_domain} 域的 sso，退回到非首选域的 sso（可能仍能用）。")
+        return fallback_value
+
+    raise Exception(f"注册完成后未获取到 sso cookie，当前已见 cookie: {sorted(last_seen_names)}")
+
+
+def wait_for_grok_com_landing(timeout: int = 90, *, skip_cf_retry: bool = False) -> bool:
+    # 注册流（accounts.x.ai/sign-up?redirect=grok-com）完成后，浏览器会经过一段
+    # SSO 重定向链，最终落到 grok.com 并把会话 cookie 写到 grok.com 域上。
+    # grok.com 是独立域，跟 .x.ai 不共享 cookie。
+    # 之前的版本在重定向链跑完之前就已经在 wait_for_sso_cookie 拿到 accounts.x.ai 的
+    # sso 抢跑返回，warm-up 接着用硬跳 (page.get) 去 grok.com，结果落在未登录状态。
+    # 这里显式等到 URL 真正变成 grok.com 且页面进入登录态再返回。
+    # P1：最终页 CF/Turnstile 卡住时 soft reset + 二次 token 复用。
+    # skip_cf_retry=True（soft-nav 已提交）：禁止再点「完成注册」，只等重定向。
+    global page
+    deadline = time.time() + timeout
+    last_url = ""
+    cf_retry = 0
+    # soft-nav：先静等重定向；仅当长时间仍停在 accounts 最终页才允许二次复用
+    soft_grace_until = time.time() + (22.0 if skip_cf_retry else 0.0)
+    if skip_cf_retry:
+        print(
+            "[*] soft-nav 已提交：先静等重定向 ~22s，期间跳过最终页二次点提交",
+            flush=True,
+        )
+    while time.time() < deadline:
+        try:
+            refresh_active_page()
+            current_url = page.url or ""
+            if current_url != last_url:
+                print(f"[*] 等待重定向到 grok.com，当前: {current_url}")
+                last_url = current_url
+
+            # mint browser 若误附着注册 Chromium，会把 URL 打到 oauth2/device / sign-in?redirect=oauth2
+            # 绝不当 CF 去点「完成注册」；尝试新开 grok.com 标签恢复会话
+            try:
+                cu = (current_url or "").lower()
+                hijack = (
+                    "oauth2/authorize" in cu
+                    or "oauth2/consent" in cu
+                    or "oauth2/device" in cu
+                    or "redirect=oauth2" in cu
+                    or ("sign-in" in cu and "oauth2" in cu)
+                    or ("/callback" in cu and "127.0.0.1" in cu)
+                )
+                if hijack:
+                    print(
+                        f"[Warn] 检测到 mint/oauth 劫持注册页: {current_url[:120]} · 尝试恢复 grok.com",
+                        flush=True,
+                    )
+                    try:
+                        if browser is not None:
+                            page = browser.new_tab("https://grok.com/")
+                            time.sleep(1.2)
+                    except Exception as re_e:
+                        print(f"[Warn] 恢复 grok.com 标签失败: {re_e}", flush=True)
+                    time.sleep(0.8)
+                    continue
+            except Exception:
+                pass
+
+            # 最终页仍停在 accounts.x.ai 且出现 Turnstile / CF 挑战
+            stuck_cf = False
+            try:
+                st = _turnstile_widget_state() if "accounts.x.ai" in current_url else {}
+                if st.get("failure") or st.get("collapsedOnly"):
+                    stuck_cf = True
+                if not stuck_cf and "accounts.x.ai" in current_url:
+                    body_cf = page.run_js(
+                        r"""
+const t = (document.body && (document.body.innerText || document.body.textContent) || '');
+return /checking your browser|just a moment|cf-browser-verification|turnstile|verify you are human/i.test(t)
+  || !!document.querySelector('iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]');
+"""
+                    )
+                    stuck_cf = bool(body_cf)
+            except Exception:
+                stuck_cf = False
+            # soft-nav 静等窗口内禁止二次点提交；窗口过后若仍卡 accounts 才复用
+            allow_cf_retry = (not skip_cf_retry) or (time.time() >= soft_grace_until)
+            if (
+                stuck_cf
+                and allow_cf_retry
+                and cf_retry < 3
+                and time.time() + 12 < deadline
+            ):
+                cf_retry += 1
+                print(f"[*] 最终页疑似 CF/Turnstile 卡住，二次复用 #{cf_retry}…")
+                try:
+                    _soft_reset_turnstile()
+                except Exception:
+                    pass
+                tok = getTurnstileToken(timeout=min(20, max(8, deadline - time.time() - 5)))
+                if tok:
+                    _inject_turnstile_token(tok)
+                    print(f"[*] 最终页 Turnstile 二次复用完成 len={len(tok)}")
+                    # 注入后必须再点「完成注册」，否则会一直停在 sign-up
+                    try:
+                        clicked = page.run_js(
+                            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const s = window.getComputedStyle(node);
+  if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+  const r = node.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'))
+  .filter((n) => isVisible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true');
+const btn = buttons.find((n) => {
+  const text = (n.innerText || n.textContent || '').replace(/\s+/g, '');
+  const t = text.toLowerCase();
+  return text.includes('完成注册') || t.includes('create account') || t.includes('sign up')
+    || t.includes('complete') || text === '注册';
+}) || buttons.find((n) => n.type === 'submit') || null;
+if (!btn) return 'no-btn';
+btn.click();
+return 'clicked';
+"""
+                        )
+                        print(f"[*] 最终页注入后重点完成注册: {clicked}")
+                    except Exception as ce:
+                        print(f"[Debug] 重点完成注册: {ce}")
+                time.sleep(1.5)
+                continue
+
+            if "grok.com" in current_url:
+                logged_in = bool(page.run_js(r"""
+function isVisible(n) {
+    if (!n) return false;
+    const s = window.getComputedStyle(n);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    const r = n.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+}
+// 已进入 chat 路径 = 必然已登录
+if (/grok\.com\/(chat|c)\//.test(location.href)) return true;
+// 输入框出现 = 已登录
+const ta = Array.from(document.querySelectorAll('textarea, [contenteditable="true"]')).find(n => isVisible(n) && !n.disabled && !n.readOnly);
+if (ta) return true;
+// 年龄确认弹窗也说明已进入产品页
+const body = (document.body && (document.body.innerText || document.body.textContent) || '');
+if (/请确认你的年龄|Confirm your age|选择你的出生年份|Select your birth year/i.test(body)) return true;
+return false;
+"""))
+                if logged_in:
+                    print(f"[*] 已落到 grok.com 并登录: {current_url}")
+                    return True
+        except PageDisconnectedError:
+            refresh_active_page()
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print(f"[Warn] 等待 grok.com 登录超时，最后 URL: {last_url}")
+    return False
+
+
+def _random_adult_birth_year() -> int:
+    """随机成年出生年：年龄约 18–45 岁（含）。"""
+    now_year = datetime.datetime.now().year
+    min_year = now_year - 45
+    max_year = now_year - 18
+    if max_year < min_year:
+        max_year = min_year
+    return min_year + secrets.randbelow(max_year - min_year + 1)
+
+
+def detect_age_gate() -> bool:
+    """页面是否出现「确认年龄 / 出生年份」弹窗。"""
+    global page
+    try:
+        refresh_active_page()
+        return bool(page.run_js(r"""
+function isVisible(n) {
+    if (!n) return false;
+    const s = window.getComputedStyle(n);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    const r = n.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+}
+const body = (document.body && (document.body.innerText || document.body.textContent) || '');
+if (/请确认你的年龄|请确认您的年龄|Confirm your age|选择你的出生年份|选择你的出生年|Select your birth year|birth year/i.test(body)) {
+    return true;
+}
+// 对话框内出现 4 位年份输入
+const yearInputs = Array.from(document.querySelectorAll('input')).filter((n) => {
+    if (!isVisible(n) || n.disabled) return false;
+    const ph = String(n.placeholder || '') + ' ' + String(n.name || '') + ' ' + String(n.getAttribute('aria-label') || '');
+    const t = String(n.type || '').toLowerCase();
+    if (/year|birth|年龄|出生/i.test(ph)) return true;
+    if ((t === 'number' || t === 'text' || t === 'tel') && Number(n.maxLength || 0) === 4) return true;
+    const v = String(n.value || '').trim();
+    if (/^(19|20)\d{2}$/.test(v)) return true;
+    return false;
+});
+return yearInputs.length > 0 && /年龄|continue|确认|confirm|年龄|age/i.test(body);
+"""))
+    except Exception:
+        return False
+
+
+def fill_age_gate_and_submit(birth_year: int | None = None, timeout: float = 25) -> bool:
+    """
+    填写年龄弹窗中的出生年份并点 Save / Continue / 继续。
+    返回 True 表示已提交或弹窗已消失；False 表示未找到/超时。
+
+    2026-07 修复：
+    - React 受控/combobox 用 setNativeValue 常写空 → fill-failed:
+    - 误点 Continue 后弹窗仍在：改 CDP 逐字键入 + 优先 Save
+    """
+    global page
+    year = int(birth_year if birth_year is not None else _random_adult_birth_year())
+    year_s = str(year)
+    deadline = time.time() + timeout
+    print(f"[*] 年龄门：尝试填写出生年 {year_s}")
+    _log_counts: dict[str, int] = {}
+
+    def _log_throttled(key: str, msg: str, limit: int = 3) -> None:
+        n = _log_counts.get(key, 0)
+        if n >= limit:
+            return
+        _log_counts[key] = n + 1
+        print(msg)
+        if n + 1 == limit:
+            print(f"[Debug] 年龄门：后续同类日志已省略（{key}）")
+
+    def _locate_year_box() -> dict | None:
+        """返回可见年份输入的中心坐标与当前值。"""
+        try:
+            refresh_active_page()
+            return page.run_js(
+                r"""
+function isVisible(n) {
+  if (!n) return false;
+  const s = window.getComputedStyle(n);
+  if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+  const r = n.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+function deepQueryAll(selector, root) {
+  const out = [];
+  const walk = (node) => {
+    if (!node) return;
+    try {
+      if (node.querySelectorAll) node.querySelectorAll(selector).forEach((el) => out.push(el));
+    } catch (e) {}
+    const children = node.children || [];
+    for (const c of children) {
+      if (c && c.shadowRoot) walk(c.shadowRoot);
+      if (c && c.nodeType === 1) walk(c);
+    }
+  };
+  walk(root || document);
+  return out;
+}
+const body = (document.body && (document.body.innerText || document.body.textContent) || '');
+const ageCtx = /请确认你的年龄|请确认您的年龄|Confirm your age|选择你的出生年份|选择你的出生年|Select your birth year|birth year|年龄/i.test(body);
+const allFields = deepQueryAll('input, textarea, [contenteditable="true"], [role="spinbutton"], [role="combobox"]');
+const inputs = allFields.filter((n) => {
+  if (!isVisible(n) || n.disabled || n.readOnly) return false;
+  const meta = [
+    n.placeholder, n.name, n.id, n.getAttribute('aria-label'), n.getAttribute('data-testid'), n.type,
+    n.getAttribute('inputmode'), n.getAttribute('autocomplete'), n.getAttribute('role')
+  ].map((x) => String(x || '')).join(' ');
+  if (/year|birth|年龄|出生|age|bday/i.test(meta)) return true;
+  const t = String(n.type || '').toLowerCase();
+  if ((t === 'number' || t === 'text' || t === 'tel') && Number(n.maxLength || 0) === 4) return true;
+  if (n.getAttribute('inputmode') === 'numeric' && ageCtx) return true;
+  if (ageCtx && (t === 'number' || t === 'text' || t === 'tel' || n.isContentEditable || n.getAttribute('role') === 'combobox')) {
+    const v = String(n.value || n.textContent || '').trim();
+    if (!v || /^(19|20)\d{0,2}$/.test(v)) return true;
+  }
+  return false;
+});
+let yearInput = inputs.find((n) => {
+  const meta = [n.placeholder, n.name, n.id, n.getAttribute('aria-label'), n.getAttribute('autocomplete'), n.getAttribute('role')].join(' ');
+  return /year|birth|出生|年龄|bday/i.test(meta);
+}) || inputs.find((n) => Number(n.maxLength || 0) === 4)
+  || inputs.find((n) => String(n.type || '').toLowerCase() === 'number')
+  || inputs.find((n) => n.getAttribute('inputmode') === 'numeric')
+  || inputs.find((n) => n.getAttribute('role') === 'combobox')
+  || inputs[0] || null;
+if (!yearInput) return ageCtx ? { missing: true, ageCtx: true } : null;
+try { yearInput.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
+const r = yearInput.getBoundingClientRect();
+return {
+  x: r.x + Math.min(r.width * 0.5, Math.max(12, r.width * 0.4)),
+  y: r.y + r.height * 0.5,
+  w: r.width,
+  h: r.height,
+  val: String(yearInput.value || yearInput.textContent || '').trim(),
+  tag: String(yearInput.tagName || ''),
+  role: String(yearInput.getAttribute('role') || ''),
+  ageCtx: !!ageCtx,
+};
+"""
+            )
+        except Exception:
+            return None
+
+    def _cdp_type_year(value: str) -> str:
+        """CDP 点击年份框后 Ctrl+A + 逐字 insertText（React 受控更稳）。"""
+        loc = _locate_year_box()
+        if not isinstance(loc, dict):
+            return "no-box"
+        if loc.get("missing"):
+            return "no-input"
+        if "x" not in loc:
+            return "no-input"
+        try:
+            try:
+                _cdp_human_click(float(loc["x"]), float(loc["y"]))
+            except Exception:
+                page.run_cdp(
+                    "Input.dispatchMouseEvent",
+                    type="mousePressed",
+                    x=float(loc["x"]),
+                    y=float(loc["y"]),
+                    button="left",
+                    clickCount=1,
+                )
+                page.run_cdp(
+                    "Input.dispatchMouseEvent",
+                    type="mouseReleased",
+                    x=float(loc["x"]),
+                    y=float(loc["y"]),
+                    button="left",
+                    clickCount=1,
+                )
+            time.sleep(0.08 + secrets.randbelow(8) / 100.0)
+            for kwargs in (
+                dict(type="keyDown", key="a", code="KeyA", modifiers=2, windowsVirtualKeyCode=65),
+                dict(type="keyUp", key="a", code="KeyA", modifiers=2, windowsVirtualKeyCode=65),
+                dict(type="keyDown", key="Backspace", code="Backspace", windowsVirtualKeyCode=8),
+                dict(type="keyUp", key="Backspace", code="Backspace", windowsVirtualKeyCode=8),
+            ):
+                try:
+                    page.run_cdp("Input.dispatchKeyEvent", **kwargs)
+                except Exception:
+                    pass
+            time.sleep(0.04)
+            for ch in str(value):
+                page.run_cdp("Input.insertText", text=ch)
+                time.sleep(0.04 + secrets.randbelow(50) / 1000.0)
+            time.sleep(0.12)
+            try:
+                page.run_cdp(
+                    "Input.dispatchKeyEvent",
+                    type="keyDown",
+                    key="Tab",
+                    code="Tab",
+                    windowsVirtualKeyCode=9,
+                )
+                page.run_cdp(
+                    "Input.dispatchKeyEvent",
+                    type="keyUp",
+                    key="Tab",
+                    code="Tab",
+                    windowsVirtualKeyCode=9,
+                )
+            except Exception:
+                pass
+            time.sleep(0.1)
+            loc2 = _locate_year_box()
+            cur = ""
+            if isinstance(loc2, dict):
+                cur = str(loc2.get("val") or "").strip()
+            if cur == str(value).strip():
+                return "cdp-ok"
+            fb = page.run_js(
+                r"""
+const year = String(arguments[0] || '');
+function isVisible(n){if(!n)return false;const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden')return false;const r=n.getBoundingClientRect();return r.width>0&&r.height>0;}
+const inputs=[...document.querySelectorAll('input,textarea,[contenteditable="true"],[role="combobox"],[role="spinbutton"]')].filter(n=>isVisible(n)&&!n.disabled);
+let el = inputs.find(n=>{
+  const meta=[n.placeholder,n.name,n.id,n.getAttribute('aria-label'),n.getAttribute('role')].join(' ');
+  return /year|birth|出生|年龄|bday/i.test(meta);
+}) || inputs.find(n=>Number(n.maxLength||0)===4) || inputs[0];
+if(!el) return 'no-el';
+el.focus();
+try{el.click();}catch(e){}
+const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set
+  || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set;
+const tracker=el._valueTracker; if(tracker) try{tracker.setValue('');}catch(e){}
+if(el.isContentEditable){ el.textContent=year; }
+else if(setter) setter.call(el, year); else el.value=year;
+const rk=Object.keys(el).find(k=>k.startsWith('__reactProps$')||k.startsWith('__reactEventHandlers$'));
+if(rk && el[rk]){
+  const p=el[rk]; const ev={target:el, currentTarget:el, bubbles:true};
+  try{ if(p.onChange) p.onChange({...ev, type:'change'}); }catch(e){}
+  try{ if(p.onInput) p.onInput({...ev, type:'input'}); }catch(e){}
+}
+el.dispatchEvent(new InputEvent('input',{bubbles:true,data:year,inputType:'insertText'}));
+el.dispatchEvent(new Event('change',{bubbles:true}));
+el.dispatchEvent(new Event('blur',{bubbles:true}));
+const cur=String(el.value||el.textContent||'').trim();
+return cur===year ? 'react-ok' : ('mismatch:'+cur);
+""",
+                value,
+            )
+            return str(fb or f"mismatch:{cur}")
+        except Exception as e:
+            return f"cdp-err:{e}"
+
+    def _click_age_submit(prefer_save: bool = True) -> str:
+        """点 Save/Continue；返回按钮文案或空。"""
+        try:
+            info = page.run_js(
+                r"""
+const preferSave = !!arguments[0];
+function isVisible(n){
+  if(!n) return false;
+  const s=getComputedStyle(n);
+  if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0) return false;
+  const r=n.getBoundingClientRect();
+  return r.width>0 && r.height>0;
+}
+function deepQueryAll(sel){
+  const out=[];
+  const walk=(node)=>{
+    if(!node) return;
+    try{ if(node.querySelectorAll) node.querySelectorAll(sel).forEach(el=>out.push(el)); }catch(e){}
+    const ch=node.children||[];
+    for(const c of ch){ if(c&&c.shadowRoot) walk(c.shadowRoot); if(c&&c.nodeType===1) walk(c); }
+  };
+  walk(document);
+  return out;
+}
+function score(n){
+  const text=(n.innerText||n.textContent||n.getAttribute('aria-label')||n.value||'').replace(/\s+/g,' ').trim();
+  const t=text.toLowerCase().replace(/\s+/g,'');
+  if(!text||text.length>36) return -1;
+  if(/google|apple|github|cookie|cancel|关闭|close|reject|skip|稍后|later|notnow|dismiss/i.test(t)) return -1;
+  let s=0;
+  if(t==='save'||text==='Save'||text==='保存') s+=320;
+  if(t.includes('save')||text.includes('保存')) s+=240;
+  // Save-first：Continue 明显降权，避免先点 Continue 再二次 Save
+  if(t==='continue'||text==='继续'||text.includes('继续')) s += preferSave ? 40 : 160;
+  if(t.includes('continue')||t.includes('confirm')||text.includes('确认')) s += preferSave ? 30 : 90;
+  if(t.includes('next')||text.includes('下一步')||t.includes('submit')) s+=70;
+  if(n.type==='submit') s+=30;
+  try{
+    const r=n.getBoundingClientRect();
+    if(r.width>=60&&r.width<=420&&r.height>=28&&r.height<=80) s+=20;
+  }catch(e){}
+  return s;
+}
+const buttons=deepQueryAll('button,[role=button],input[type=submit],a').filter(n=>isVisible(n)&&!n.disabled&&n.getAttribute('aria-disabled')!=='true');
+const ranked=buttons.map(n=>({n,s:score(n),t:(n.innerText||n.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim().slice(0,28)})).filter(x=>x.s>0).sort((a,b)=>b.s-a.s);
+if(!ranked.length) return {ok:false, labels: buttons.slice(0,10).map(n=>(n.innerText||n.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim().slice(0,20)).filter(Boolean)};
+const best=ranked[0];
+try{ best.n.removeAttribute('disabled'); best.n.disabled=false; best.n.setAttribute('aria-disabled','false'); }catch(e){}
+try{ best.n.scrollIntoView({block:'center'}); }catch(e){}
+const r=best.n.getBoundingClientRect();
+return {ok:true, text:best.t, x:r.x+r.width/2, y:r.y+r.height/2, score:best.s};
+""",
+                prefer_save,
+            )
+        except Exception as e:
+            return f"err:{e}"
+        if not isinstance(info, dict) or not info.get("ok"):
+            for lab in ("Save", "保存", "Continue", "继续", "Confirm", "确认"):
+                try:
+                    el = page.ele(f"text:{lab}", timeout=0.3)
+                    if not el:
+                        continue
+                    try:
+                        box = el.rect
+                        mx = float(getattr(box, "mid_x", 0) or 0)
+                        my = float(getattr(box, "mid_y", 0) or 0)
+                        if mx > 0 and my > 0:
+                            _cdp_human_click(mx, my)
+                            return lab
+                    except Exception:
+                        pass
+                    try:
+                        el.click(by_js=False)
+                    except Exception:
+                        el.click()
+                    return lab
+                except Exception:
+                    continue
+            return ""
+        try:
+            _cdp_human_click(float(info["x"]), float(info["y"]))
+        except Exception:
+            try:
+                page.run_js(
+                    "const x=arguments[0],y=arguments[1]; const el=document.elementFromPoint(x,y); if(el){ el.click(); return true;} return false;",
+                    float(info["x"]),
+                    float(info["y"]),
+                )
+            except Exception:
+                pass
+        return str(info.get("text") or "ok")
+
+    def _year_value() -> str:
+        loc = _locate_year_box()
+        if isinstance(loc, dict):
+            return str(loc.get("val") or "").strip()
+        return ""
+
+    def _pick_list_year() -> bool:
+        try:
+            ok = page.run_js(
+                r"""
+const year = String(arguments[0]||'');
+function isVisible(n){if(!n)return false;const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden')return false;const r=n.getBoundingClientRect();return r.width>0&&r.height>0;}
+const opts=[...document.querySelectorAll('[role="option"], [role="listbox"] button, select option, li')].filter(isVisible);
+const hit=opts.find(n=>String(n.innerText||n.textContent||n.value||'').trim()===year);
+if(!hit) return false;
+hit.click();
+return true;
+""",
+                year_s,
+            )
+            return bool(ok)
+        except Exception:
+            return False
+
+    while time.time() < deadline:
+        try:
+            refresh_active_page()
+        except Exception:
+            pass
+        if not detect_age_gate():
+            if _log_counts.get("submitted"):
+                print("[*] 年龄门：弹窗已关闭")
+                return True
+            return False
+
+        typed = _cdp_type_year(year_s)
+        if typed in ("no-input", "no-box"):
+            if _pick_list_year():
+                typed = "list-ok"
+            else:
+                _log_throttled("no-input", f"[Debug] 年龄门：未找到年份输入 typed={typed}")
+                time.sleep(0.5)
+                continue
+        cur = _year_value()
+        if cur != year_s and "ok" not in typed and typed != "list-ok":
+            _log_throttled("fill-failed", f"[Debug] 年龄门：年份写入失败 {typed} cur={cur!r}")
+            _pick_list_year()
+            typed2 = _cdp_type_year(year_s)
+            cur = _year_value()
+            if cur != year_s and "ok" not in str(typed2):
+                time.sleep(0.45)
+                continue
+
+        # Save-first：填完后短等 Save 出现，再点（Continue 降权）
+        time.sleep(0.12 + secrets.randbelow(10) / 100.0)
+        wait_save_deadline = time.time() + 0.85
+        while time.time() < wait_save_deadline:
+            try:
+                has_save = page.run_js(
+                    r"""
+function isVisible(n){if(!n)return false;const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden')return false;const r=n.getBoundingClientRect();return r.width>0&&r.height>0;}
+const nodes=[...document.querySelectorAll('button,[role=button],input[type=submit]')].filter(isVisible);
+return nodes.some(n=>{
+  const t=(n.innerText||n.textContent||n.getAttribute('aria-label')||n.value||'').replace(/\s+/g,' ').trim().toLowerCase();
+  return t==='save'||t==='保存'||t.includes('save')||t.includes('保存');
+});
+"""
+                )
+                if has_save:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.12)
+        lbl = _click_age_submit(prefer_save=True)
+        if not lbl:
+            _log_throttled("no-btn", "[Debug] 年龄门：年份已填，未找到 Save/Continue")
+            time.sleep(0.5)
+            continue
+        _log_counts["submitted"] = _log_counts.get("submitted", 0) + 1
+        print(f"[*] 年龄门：已提交出生年 {year_s} via={lbl!r} fill={typed}")
+        time.sleep(0.95)
+        if not detect_age_gate():
+            print("[*] 年龄门：弹窗已关闭")
+            return True
+        # 若首点落在 Continue 类按钮，立刻再点 Save（年份仍在则不重填）
+        lbl_l = str(lbl or "").lower()
+        if "save" not in lbl_l and "保存" not in str(lbl or ""):
+            print("[*] 年龄门：首点非 Save，立即补点 Save…")
+            if _year_value() != year_s:
+                _cdp_type_year(year_s)
+            time.sleep(0.12)
+            lbl2 = _click_age_submit(prefer_save=True)
+            if lbl2:
+                print(f"[*] 年龄门：Save 补点 via={lbl2!r}")
+            time.sleep(0.9)
+            if not detect_age_gate():
+                print("[*] 年龄门：弹窗已关闭")
+                return True
+        else:
+            print("[*] 年龄门：已点 Save，弹窗可能仍在，再填一次并优先 Save…")
+            if _year_value() != year_s:
+                _cdp_type_year(year_s)
+            time.sleep(0.15)
+            lbl2 = _click_age_submit(prefer_save=True)
+            if lbl2:
+                print(f"[*] 年龄门：二次提交 via={lbl2!r}")
+            time.sleep(0.9)
+            if not detect_age_gate():
+                print("[*] 年龄门：弹窗已关闭")
+                return True
+        time.sleep(0.45)
+
+    try:
+        if not detect_age_gate():
+            print(f"[*] 年龄门：超时复查弹窗已消失，视为成功（年 {year_s}）")
+            return True
+    except Exception:
+        pass
+    print(f"[Warn] 年龄门：处理超时（目标年 {year_s}）")
+    return False
+
+
+
+# 年龄门触发用的随机英文短句（避免固定「你好」）
+_AGE_GATE_TRIGGER_MESSAGES = (
+    "hi",
+    "hello",
+    "hey",
+    "hello there",
+    "hi there",
+    "good day",
+    "how are you",
+    "what's up",
+    "hey grok",
+    "hello world",
+    "good morning",
+    "good evening",
+    "yo",
+    "greetings",
+    "hi friend",
+)
+
+
+def _random_age_gate_message() -> str:
+    return secrets.choice(_AGE_GATE_TRIGGER_MESSAGES)
+
+
+def send_chat_message(text: str | None = None, timeout: float = 20) -> bool:
+    """在 grok.com 输入框发送一条消息（用于触发生日/年龄门）。默认随机英文。
+
+    Grok 新 UI：合成 KeyboardEvent 的 Enter 无效；发送钮是圆形 ↑（无 Send 文案）。
+    必须：填入 → CDP 点 ↑ / 真 Enter → 校验输入框已清空，禁止假成功 sent-enter。
+    """
+    global page
+    msg = str(text or "").strip() or _random_age_gate_message()
+    deadline = time.time() + timeout
+    print(f"[*] 发送聊天消息以触发年龄门: {msg!r}")
+
+    def _on_grok_chat() -> bool:
+        """当前页面是否落在 grok.com（年龄门发消息的前提）。"""
+        try:
+            u = str(getattr(page, "url", "") or "").lower()
+        except Exception:
+            u = ""
+        return "grok.com" in u
+
+    def _composer_snapshot():
+        try:
+            return page.run_js(
+                r"""
+function isVisible(n) {
+  if (!n) return false;
+  const s = window.getComputedStyle(n);
+  if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+  const r = n.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+function isEditableBox(n) {
+  if (!n || n.disabled || n.readOnly) return false;
+  const tag = (n.tagName || '').toUpperCase();
+  if (tag === 'TEXTAREA' || tag === 'INPUT') return true;
+  if (n.isContentEditable) return true;
+  if (String(n.getAttribute('contenteditable') || '').toLowerCase() === 'true') return true;
+  if (String(n.getAttribute('role') || '').toLowerCase() === 'textbox') return true;
+  return false;
+}
+const raw = Array.from(document.querySelectorAll(
+  'textarea, input[type="text"], input:not([type]), [contenteditable="true"], [contenteditable=""], div[role="textbox"], [role="textbox"]'
+)).filter((n) => isVisible(n) && isEditableBox(n));
+const scored = raw.map((n) => {
+  const meta = [n.placeholder, n.getAttribute('aria-label'), n.getAttribute('data-testid'), n.name, n.id].join(' ');
+  if (/year|birth|年龄|出生/i.test(meta)) return null;
+  const r = n.getBoundingClientRect();
+  if (r.width < 80 || r.height < 18) return null;
+  const tag = (n.tagName || '').toUpperCase();
+  let score = r.width * r.height;
+  if (tag === 'TEXTAREA') score += 1e7;
+  if (tag === 'INPUT') score += 5e6;
+  if (n.isContentEditable || String(n.getAttribute('role') || '') === 'textbox') score += 1e6;
+  score += (r.top / Math.max(window.innerHeight, 1)) * 1e5;
+  return { n, score, r };
+}).filter(Boolean);
+scored.sort((a, b) => b.score - a.score);
+const input = scored.length ? scored[0].n : null;
+if (!input) return { ok: false, why: 'no-input' };
+const r = input.getBoundingClientRect();
+const val = String(input.value || input.innerText || input.textContent || '').replace(/\s+/g, ' ').trim();
+const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(isVisible);
+let send = null;
+let sendScore = -1;
+for (const b of buttons) {
+  if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+  const br = b.getBoundingClientRect();
+  const label = [
+    b.getAttribute('aria-label') || '',
+    b.getAttribute('data-testid') || '',
+    b.getAttribute('title') || '',
+    b.innerText || '',
+  ].join(' ').replace(/\s+/g, ' ').trim();
+  const tl = label.toLowerCase();
+  if (/fast|auto|attach|upload|plus|microphone|voice|record|image|file|model/i.test(tl)
+      && !/send|submit|提交|发送/i.test(tl)) {
+    continue;
+  }
+  let s = 0;
+  if (/^send$|submit|发送|提交/i.test(tl)) s += 200;
+  if (/send|submit/i.test(tl)) s += 120;
+  if (br.width >= 28 && br.width <= 64 && br.height >= 28 && br.height <= 64) s += 40;
+  if (Math.abs((br.top + br.height / 2) - (r.top + r.height / 2)) < 80) s += 50;
+  if (br.left > r.left + r.width * 0.5) s += 30;
+  if (br.left > r.right - 20) s += 20;
+  if (b.querySelector('svg, path')) s += 15;
+  if (s > sendScore) { sendScore = s; send = b; }
+}
+let sendBox = null;
+if (send && sendScore >= 40) {
+  const br = send.getBoundingClientRect();
+  sendBox = {
+    x: br.x + br.width / 2,
+    y: br.y + br.height / 2,
+    w: br.width,
+    h: br.height,
+    label: (send.getAttribute('aria-label') || send.innerText || '').slice(0, 40),
+    score: sendScore,
+  };
+}
+return {
+  ok: true,
+  val,
+  inputBox: { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height },
+  sendBox,
+};
+"""
+            )
+        except Exception as e:
+            return {"ok": False, "why": f"snap:{e}"}
+
+    def _fill_composer(value: str) -> str:
+        try:
+            return str(
+                page.run_js(
+                    r"""
+const msg = String(arguments[0] || '');
+function isVisible(n) {
+  if (!n) return false;
+  const s = window.getComputedStyle(n);
+  if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+  const r = n.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+function isEditableBox(n) {
+  if (!n || n.disabled || n.readOnly) return false;
+  const tag = (n.tagName || '').toUpperCase();
+  if (tag === 'TEXTAREA' || tag === 'INPUT') return true;
+  if (n.isContentEditable) return true;
+  if (String(n.getAttribute('contenteditable') || '').toLowerCase() === 'true') return true;
+  if (String(n.getAttribute('role') || '').toLowerCase() === 'textbox') return true;
+  return false;
+}
+function fillChatInput(el, value) {
+  const tag = (el.tagName || '').toUpperCase();
+  const isNativeField = tag === 'TEXTAREA' || tag === 'INPUT';
+  el.focus();
+  try { el.click(); } catch (e) {}
+  if (isNativeField) {
+    const proto = tag === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    const tracker = el._valueTracker;
+    if (tracker) { try { tracker.setValue(''); } catch (e) {} }
+    if (nativeSetter) { nativeSetter.call(el, ''); nativeSetter.call(el, value); }
+    else { el.value = value; }
+    el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return String(el.value || '') === String(value) ? 'native-ok' : 'native-mismatch';
+  }
+  try {
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch (e) {}
+  try {
+    if (document.execCommand) {
+      document.execCommand('selectAll', false, null);
+      document.execCommand('insertText', false, value);
+      if ((el.innerText || el.textContent || '').includes(value)) return 'ce-exec';
+    }
+  } catch (e) {}
+  try {
+    el.textContent = value;
+    if (!(el.innerText || el.textContent || '').trim()) {
+      el.innerHTML = '';
+      el.appendChild(document.createTextNode(value));
+    }
+    el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return (el.innerText || el.textContent || '').includes(value) ? 'ce-dom' : 'ce-fail';
+  } catch (e) {
+    return 'ce-err';
+  }
+}
+const raw = Array.from(document.querySelectorAll(
+  'textarea, input[type="text"], input:not([type]), [contenteditable="true"], [contenteditable=""], div[role="textbox"], [role="textbox"]'
+)).filter((n) => isVisible(n) && isEditableBox(n));
+const scored = raw.map((n) => {
+  const meta = [n.placeholder, n.getAttribute('aria-label'), n.getAttribute('data-testid'), n.name, n.id].join(' ');
+  if (/year|birth|年龄|出生/i.test(meta)) return null;
+  const r = n.getBoundingClientRect();
+  if (r.width < 80 || r.height < 18) return null;
+  const tag = (n.tagName || '').toUpperCase();
+  let score = r.width * r.height;
+  if (tag === 'TEXTAREA') score += 1e7;
+  if (tag === 'INPUT') score += 5e6;
+  if (n.isContentEditable || String(n.getAttribute('role') || '') === 'textbox') score += 1e6;
+  score += (r.top / Math.max(window.innerHeight, 1)) * 1e5;
+  return { n, score };
+}).filter(Boolean);
+scored.sort((a, b) => b.score - a.score);
+if (!scored.length) return 'no-input';
+return fillChatInput(scored[0].n, msg);
+""",
+                    value,
+                )
+                or "no-result"
+            )
+        except Exception as e:
+            return f"fill-err:{e}"
+
+    def _cdp_press_enter() -> None:
+        for typ in ("keyDown", "keyUp"):
+            kwargs = dict(
+                type=typ,
+                key="Enter",
+                code="Enter",
+                windowsVirtualKeyCode=13,
+                nativeVirtualKeyCode=13,
+            )
+            if typ == "keyDown":
+                kwargs["text"] = "\r"
+                kwargs["unmodifiedText"] = "\r"
+            page.run_cdp("Input.dispatchKeyEvent", **kwargs)
+            time.sleep(0.03)
+
+    def _cdp_click_xy(x: float, y: float) -> None:
+        try:
+            _cdp_human_click(float(x), float(y))
+        except Exception:
+            page.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mousePressed",
+                x=float(x),
+                y=float(y),
+                button="left",
+                buttons=1,
+                clickCount=1,
+            )
+            time.sleep(0.04)
+            page.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseReleased",
+                x=float(x),
+                y=float(y),
+                button="left",
+                buttons=0,
+                clickCount=1,
+            )
+
+    def _send_verified(msg_text: str) -> bool:
+        """发送后必须验证：输入框不再包含原文。"""
+        snap = _composer_snapshot()
+        if not isinstance(snap, dict) or not snap.get("ok"):
+            return False
+        val = str(snap.get("val") or "")
+        if not val:
+            return True
+        if msg_text not in val and len(val) < max(2, len(msg_text) // 2):
+            return True
+        try:
+            hit = page.run_js(
+                r"""
+const msg = String(arguments[0] || '');
+const editable = document.activeElement;
+const nodes = Array.from(document.querySelectorAll('[data-testid], article, div, p, span'))
+  .filter((n) => {
+    const t = (n.innerText || n.textContent || '').trim();
+    return t === msg || t.startsWith(msg);
+  })
+  .slice(0, 12);
+for (const n of nodes) {
+  if (editable && (n === editable || editable.contains(n) || n.contains(editable))) continue;
+  const r = n.getBoundingClientRect();
+  if (r.width > 20 && r.height > 10) return true;
+}
+const suggest = Array.from(document.querySelectorAll('button, a, div')).some((n) => {
+  const t = (n.innerText || '').toLowerCase();
+  return t.includes('explain the correct usage') || t.includes('general kenobi');
+});
+// 建议还在 + 输入框仍有字 → 未发送
+return false;
+""",
+                msg_text,
+            )
+            return bool(hit)
+        except Exception:
+            return False
+
+    no_input_count = 0
+    while time.time() < deadline:
+        try:
+            refresh_active_page()
+            if detect_age_gate():
+                print("[*] 发送前已检测到年龄门，跳过发消息")
+                return True
+
+            filled = _fill_composer(msg)
+            if filled == "no-input":
+                if detect_age_gate():
+                    print("[*] 发消息时检测到年龄门")
+                    return True
+                # 提前退出：连续找不到输入框且当前页不在 grok.com，说明注册后
+                # 没落到聊天页（如卡在 accounts.x.ai/account）。此处再等也无输入框，
+                # 空转到超时只会刷 no-input，直接放弃省 ~20s（不影响 SSO 落盘）。
+                no_input_count += 1
+                if no_input_count >= 3 and not _on_grok_chat():
+                    print(
+                        "[*] 未落到 grok.com 聊天页（输入框缺失），跳过年龄门发消息"
+                    )
+                    return False
+                print("[Debug] 发消息状态: no-input")
+                time.sleep(0.8)
+                continue
+            if any(x in str(filled) for x in ("fail", "err", "mismatch")):
+                print(f"[Debug] 填入聊天框: {filled}")
+                time.sleep(0.5)
+                continue
+
+            snap = _composer_snapshot()
+            how = ""
+            # 1) 优先点圆形 ↑ 发送钮
+            if isinstance(snap, dict) and isinstance(snap.get("sendBox"), dict):
+                sb = snap["sendBox"]
+                try:
+                    _cdp_click_xy(float(sb["x"]), float(sb["y"]))
+                    how = f"cdp-send-btn:{(sb.get('label') or '')}@{int(sb['x'])},{int(sb['y'])}"
+                except Exception as e:
+                    how = f"cdp-send-btn-fail:{e}"
+
+            # 2) CDP 真 Enter（合成 KeyboardEvent 无效）
+            need_enter = (not how.startswith("cdp-send-btn:")) or ("fail" in how)
+            if need_enter or True:
+                # 即使点了发送钮也补一次 Enter，双保险
+                try:
+                    if isinstance(snap, dict) and isinstance(snap.get("inputBox"), dict):
+                        ib = snap["inputBox"]
+                        try:
+                            _cdp_click_xy(float(ib["x"]), float(ib["y"]))
+                            time.sleep(0.06)
+                        except Exception:
+                            pass
+                    # 重新 focus 后再 Enter：点发送钮后焦点可能丢
+                    if how.startswith("cdp-send-btn:") and "fail" not in how:
+                        time.sleep(0.35)
+                        if _send_verified(msg):
+                            print(f"[*] 聊天消息已发送（{how}）")
+                            time.sleep(0.8)
+                            return True
+                        # 发送钮可能没点中，再 Enter
+                        if isinstance(snap, dict) and isinstance(snap.get("inputBox"), dict):
+                            ib = snap["inputBox"]
+                            try:
+                                _cdp_click_xy(float(ib["x"]), float(ib["y"]))
+                                time.sleep(0.05)
+                            except Exception:
+                                pass
+                    _cdp_press_enter()
+                    how = (how + "+" if how else "") + "cdp-enter"
+                except Exception as e:
+                    how = (how + "+" if how else "") + f"cdp-enter-fail:{e}"
+                    try:
+                        page.run_js(
+                            r"""
+const buttons = Array.from(document.querySelectorAll('button,[role=button]'));
+const b = buttons.find((n) => {
+  if (n.disabled || n.getAttribute('aria-disabled') === 'true') return false;
+  const lab = ((n.getAttribute('aria-label')||'')+(n.getAttribute('data-testid')||'')+(n.innerText||'')).toLowerCase();
+  if (/send|submit|发送|提交/.test(lab)) return true;
+  const r = n.getBoundingClientRect();
+  return r.width>=28 && r.width<=64 && r.height>=28 && r.height<=64 && n.querySelector('svg');
+});
+if (b) { b.click(); return true; }
+return false;
+"""
+                        )
+                        how += "+js-click"
+                    except Exception:
+                        pass
+
+            time.sleep(0.9)
+            if _send_verified(msg):
+                print(f"[*] 聊天消息已发送（{how or 'verified'}）")
+                time.sleep(0.8)
+                return True
+
+            # 再点一次发送钮
+            snap2 = _composer_snapshot()
+            if isinstance(snap2, dict) and isinstance(snap2.get("sendBox"), dict):
+                sb = snap2["sendBox"]
+                try:
+                    _cdp_click_xy(float(sb["x"]), float(sb["y"]))
+                    time.sleep(0.9)
+                    if _send_verified(msg):
+                        print("[*] 聊天消息已发送（retry-send-btn）")
+                        return True
+                except Exception:
+                    pass
+
+            still = ""
+            if isinstance(snap2, dict):
+                still = str(snap2.get("val") or "")[:80]
+            print(
+                f"[Debug] 发消息未确认 how={how} still_in_box={still!r} "
+                f"send={(snap2.get('sendBox') if isinstance(snap2, dict) else None)}"
+            )
+        except PageDisconnectedError:
+            refresh_active_page()
+        except Exception as e:
+            print(f"[Debug] 发消息异常: {e}")
+
+        time.sleep(0.8)
+
+    print("[Warn] 发送聊天消息超时（未能确认已发出）")
+    return False
+
+
+def ensure_age_gate_completed(
+    trigger_message: str | None = None,
+    timeout: float = 45,
+) -> dict:
+    """
+    注册落到 grok.com 后：
+      1) 若已有年龄弹窗 → 直接填随机成年出生年
+      2) 否则先发一条随机英文短消息触发弹窗，再填写
+    失败不抛异常（避免拖死整轮注册），返回状态 dict。
+    """
+    global page
+    birth_year = _random_adult_birth_year()
+    message = (trigger_message or "").strip() or _random_age_gate_message()
+    status = {
+        "attempted": True,
+        "triggered_by_message": False,
+        "trigger_message": message,
+        "age_gate_seen": False,
+        "submitted": False,
+        "birth_year": birth_year,
+    }
+    deadline = time.time() + timeout
+
+    try:
+        # 先等页面稍稳
+        time.sleep(1.0)
+        refresh_active_page()
+
+        if detect_age_gate():
+            status["age_gate_seen"] = True
+            status["submitted"] = fill_age_gate_and_submit(birth_year, timeout=min(25, deadline - time.time()))
+            return status
+
+        # 发随机英文消息触发
+        sent = send_chat_message(message, timeout=min(20, max(5, deadline - time.time())))
+        status["triggered_by_message"] = bool(sent)
+
+        # 等待弹窗出现
+        wait_end = time.time() + min(20, max(3, deadline - time.time()))
+        while time.time() < wait_end:
+            if detect_age_gate():
+                status["age_gate_seen"] = True
+                break
+            time.sleep(0.6)
+
+        if not status["age_gate_seen"]:
+            print("[*] 年龄门：发消息后未出现弹窗（可能账号无需确认或已确认）")
+            return status
+
+        remain = max(8, deadline - time.time())
+        status["submitted"] = fill_age_gate_and_submit(birth_year, timeout=remain)
+
+        # 提交后有时需再点一次继续 / 或输入框恢复
+        if status["submitted"]:
+            time.sleep(1.0)
+            if detect_age_gate():
+                print("[*] 年龄门：提交后仍在，再试一次…")
+                status["submitted"] = fill_age_gate_and_submit(birth_year, timeout=12)
+    except Exception as e:
+        print(f"[Warn] 年龄门流程异常（不影响 sso 落盘）: {e}")
+        status["error"] = str(e)
+
+    if status.get("submitted"):
+        print(f"[*] 年龄门完成 | birth_year={birth_year}")
+    elif status.get("age_gate_seen"):
+        print(f"[Warn] 年龄门已出现但未成功提交 | birth_year={birth_year}")
+    return status
+
+
+def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE, email="", password=""):
+    # 一行：邮箱 | 密码 | sso（号池导入与导出一致）
+    normalized = str(sso_value or "").strip()
+    if not normalized:
+        raise Exception("待写入的 sso 为空")
+
+    email_s = str(email or "").strip()
+    password_s = str(password or "").strip()
+    line = f"{email_s} | {password_s} | {normalized}"
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "a", encoding="utf-8") as file:
+        file.write(line + "\n")
+
+    print(f"[*] 已追加写入 邮箱|密码|sso 到文件: {output_path}")
+
+
+def push_sso_to_api(new_tokens: list):
+    # 推送 SSO token 到 grok2api 管理接口（chenyme/grok2api v2 协议）。
+    # POST <endpoint>/admin/api/tokens/add  body {"pool": ..., "tokens": [...]}
+    # 后端自带去重，重复的会进 skipped 计数；不需要先 GET 再合并。
+    import json
+    import urllib3
+    import requests
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            conf = json.load(f)
+    except Exception as e:
+        print(f"[Warn] 读取 config.json 失败，跳过推送: {e}")
+        return
+
+    api_conf = conf.get("api", {})
+    endpoint = str(api_conf.get("endpoint", "")).strip().rstrip("/")
+    api_token = str(api_conf.get("token", "")).strip()
+    pool = str(api_conf.get("pool", "basic")).strip() or "basic"
+
+    if not endpoint or not api_token:
+        return
+
+    tokens_to_push = [t for t in new_tokens if t]
+    if not tokens_to_push:
+        return
+
+    url = f"{endpoint}/admin/api/tokens/add"
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            json={"pool": pool, "tokens": tokens_to_push},
+            headers=headers,
+            timeout=60,
+            verify=False,
+        )
+        if resp.status_code == 200:
+            data = resp.json() if resp.text else {}
+            count = data.get("count", len(tokens_to_push))
+            skipped = data.get("skipped", 0)
+            print(f"[*] SSO token 已推送到号池（pool={pool}, 新增={count}, 跳过={skipped}): {url}")
+        else:
+            print(f"[Warn] 推送 API 返回异常: HTTP {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Warn] 推送 API 失败: {e}")
+
+
+def run_single_registration(
+    output_path=DEFAULT_SSO_FILE, extract_numbers=False, *, plan: str = "a"
+):
+    # 单轮流程：打开注册页 -> 完成注册 -> 触发生日门(可选) -> 获取 sso -> 写 txt。
+    # plan="a"：本项目主流程；plan="b"：Plan B 兜底（FlowPilot 人机等待/模拟点击/CF 拦截）
+    # 收码失败：换邮箱最多 max_mail_retry 次（AccountRetryNeeded），不整轮失败。
+    plan_mode = "b" if str(plan or "a").lower() in ("b", "plan_b", "plan-b", "2") else "a"
+    # 横幅由主循环打印，避免与 run_single_registration 重复
+
+    max_mail_retry = 3
+    try:
+        import json as _json_mod
+        from runtime_gc import load_max_mail_retry
+
+        conf_mail = {}
+        try:
+            with open(
+                os.path.join(os.path.dirname(__file__), "config.json"),
+                "r",
+                encoding="utf-8",
+            ) as _cf:
+                conf_mail = _json_mod.load(_cf) or {}
+        except Exception:
+            conf_mail = {}
+        max_mail_retry = load_max_mail_retry(conf_mail)
+    except Exception:
+        max_mail_retry = 3
+
+    email = ""
+    dev_token = ""
+    profile = None
+    last_mail_err: Exception | None = None
+    for mail_try in range(1, max_mail_retry + 1):
+        try:
+            if mail_try == 1:
+                open_signup_page()
+            else:
+                print(
+                    f"[*] 收码/邮箱重试 {mail_try}/{max_mail_retry} · 重新打开注册页…",
+                    flush=True,
+                )
+                try:
+                    open_signup_page()
+                except Exception as oe:
+                    # 已在注册页时 open 可能失败，继续填邮箱
+                    print(f"[Warn] 重试开页: {oe}", flush=True)
+            if plan_mode == "b" and mail_try == 1:
+                try:
+                    from plan_b import detect_cf_security_block, human_pause_major
+
+                    human_pause_major(600, 1400)
+                    blk = detect_cf_security_block(page)
+                    if blk:
+                        raise Exception(f"CF 安全拦截({blk})，Plan B 放弃")
+                except Exception as e:
+                    if "CF 安全拦截" in str(e):
+                        raise
+                    print(f"[plan-b] 开页预检跳过: {e}")
+            email, dev_token = fill_email_and_submit()
+            code = fill_code_and_submit(email, dev_token)
+            # 协议发码后通常无资料页：A/B 走 hybrid 收尾（Turnstile + Server Action + SSO）
+            # pure_browser：禁止 hybrid 收尾，强制等/填资料表单（全浏览器链路）
+            need_hybrid_finish = True
+            if _pure_browser_mode():
+                need_hybrid_finish = False
+                print(
+                    f"[plan-{plan_mode}] pure_browser=1 · 禁用 hybrid 收尾，走 UI 资料页",
+                    flush=True,
+                )
+                # 给 SPA 一点时间从 OTP 切到 profile
+                for _wait_i in range(12):
+                    try:
+                        if has_profile_form():
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.8)
+            else:
+                try:
+                    if has_profile_form():
+                        need_hybrid_finish = False
+                except Exception:
+                    need_hybrid_finish = True
+            if need_hybrid_finish:
+                print(
+                    f"[plan-{plan_mode}] 无资料表单（协议发码路径）→ hybrid 收尾…",
+                    flush=True,
+                )
+                if plan_mode == "b":
+                    try:
+                        from plan_b import human_pause_major
+
+                        human_pause_major(400, 900)
+                    except Exception:
+                        pass
+                from hybrid_register import hybrid_register
+
+                clean_code = str(code or "").replace("-", "").replace(" ", "").strip()
+                hy = hybrid_register(
+                    email=email,
+                    mail_token=str(dev_token or ""),
+                    create_email_done=True,
+                    email_code=clean_code,
+                    log=lambda m: print(m, flush=True),
+                )
+                if not hy.get("ok"):
+                    raise Exception(
+                        f"plan-{plan_mode} hybrid 收尾失败: {hy.get('error') or hy}"
+                    )
+                profile = {
+                    "given_name": "",
+                    "family_name": "",
+                    "password": str(hy.get("password") or ""),
+                    "plan": plan_mode,
+                    "via": "protocol+hybrid",
+                    "hybrid_done": True,
+                    "sso": str(hy.get("sso") or ""),
+                    "cookies": hy.get("cookies") or [],
+                    "cf_clearance": hy.get("cf_clearance") or "",
+                    "nav_soft": True,
+                }
+                print(
+                    f"[plan-{plan_mode}] hybrid 收尾成功 sso_len={len(profile.get('sso') or '')}",
+                    flush=True,
+                )
+            else:
+                print(f"[*] 填写注册资料并提交（Plan {plan_mode.upper()}）…")
+                if _pure_browser_mode():
+                    _pure_browser_pause(900, 2400)
+                    # 资料提交前再扰动一次指针（$registration 事件前的行为窗口）
+                    try:
+                        import random as _rnd2
+
+                        sx = 200 + _rnd2.randint(0, 500)
+                        sy = 220 + _rnd2.randint(0, 300)
+                        for _k in range(6 + _rnd2.randint(0, 6)):
+                            page.run_cdp(
+                                "Input.dispatchMouseEvent",
+                                type="mouseMoved",
+                                x=float(sx + _rnd2.randint(-30, 90)),
+                                y=float(sy + _rnd2.randint(-20, 60)),
+                            )
+                            time.sleep(0.02 + _rnd2.random() * 0.04)
+                            sx += _rnd2.randint(-20, 40)
+                            sy += _rnd2.randint(-15, 25)
+                    except Exception:
+                        pass
+                    _pure_browser_pause(400, 1100)
+                try:
+                    profile = fill_profile_and_submit(mode=plan_mode)
+                except Exception as pe:
+                    em = str(pe)
+                    if "刷新" in em or "连接已断开" in em or "disconnected" in em.lower():
+                        print(
+                            f"[Warn] 资料提交遇导航断开，继续等 SSO（密码可能未落盘）: {em[:120]}"
+                        )
+                        profile = {
+                            "given_name": "",
+                            "family_name": "",
+                            "password": "",
+                            "plan": plan_mode,
+                            "nav_soft": True,
+                        }
+                    else:
+                        # pure_browser：禁止 hybrid 收尾（会在 Turnstile failure 后无限重试卡死）
+                        if _pure_browser_mode():
+                            raise Exception(
+                                f"pure_browser=1 · 资料页失败且禁止 hybrid 收尾: {em[:160]}"
+                            ) from pe
+                        # Turnstile CF failure 页：hybrid 同样解不了，fail-fast 换号/换代理
+                        if "failure 反馈页" in em or "Cloudflare 返回 failure" in em:
+                            raise Exception(
+                                f"plan-{plan_mode} Turnstile failure（跳过 hybrid 卡死重试）: {em[:160]}"
+                            ) from pe
+                        print(
+                            f"[Warn] 资料页失败，改 hybrid 收尾: {em[:120]}",
+                            flush=True,
+                        )
+                        from hybrid_register import hybrid_register
+
+                        clean_code = (
+                            str(code or "").replace("-", "").replace(" ", "").strip()
+                        )
+                        hy = hybrid_register(
+                            email=email,
+                            mail_token=str(dev_token or ""),
+                            create_email_done=True,
+                            email_code=clean_code,
+                            log=lambda m: print(m, flush=True),
+                        )
+                        if not hy.get("ok"):
+                            raise Exception(
+                                f"plan-{plan_mode} hybrid 收尾失败: {hy.get('error') or hy}"
+                            ) from pe
+                        profile = {
+                            "given_name": "",
+                            "family_name": "",
+                            "password": str(hy.get("password") or ""),
+                            "plan": plan_mode,
+                            "via": "protocol+hybrid",
+                            "hybrid_done": True,
+                            "sso": str(hy.get("sso") or ""),
+                            "cookies": hy.get("cookies") or [],
+                            "cf_clearance": hy.get("cf_clearance") or "",
+                            "nav_soft": True,
+                        }
+            last_mail_err = None
+            break
+        except AccountRetryNeeded as re:
+            last_mail_err = re
+            print(
+                f"[*] 可换邮箱重试（{mail_try}/{max_mail_retry}）: {re}",
+                flush=True,
+            )
+            if mail_try >= max_mail_retry:
+                raise Exception(
+                    f"收码失败已达 max_mail_retry={max_mail_retry}: {re}"
+                ) from re
+            continue
+        except Exception as e:
+            # 获取邮箱失败也可换邮箱重试
+            msg = str(e)
+            if "获取邮箱失败" in msg or "创建邮箱失败" in msg or "获取验证码失败" in msg:
+                last_mail_err = e
+                print(
+                    f"[*] 邮箱阶段失败，换邮箱重试（{mail_try}/{max_mail_retry}）: {e}",
+                    flush=True,
+                )
+                if mail_try >= max_mail_retry:
+                    raise
+                continue
+            raise
+    if profile is None:
+        raise Exception(f"邮箱/收码阶段失败: {last_mail_err or 'unknown'}")
+    # hybrid 收尾已带 SSO：跳过 grok.com 落地 / 年龄门 cookie 等待
+    if isinstance(profile, dict) and profile.get("hybrid_done") and profile.get("sso"):
+        print("[*] hybrid 收尾已含 SSO，跳过浏览器落地等待", flush=True)
+        age_status = {
+            "submitted": False,
+            "skipped": True,
+            "reason": "protocol+hybrid",
+        }
+        sso_value = str(profile.get("sso") or "")
+        password = str(profile.get("password") or "")
+    else:
+        # 注册完成后等浏览器跑完 SSO 重定向链落到 grok.com 并登录
+        _nav_soft = bool(isinstance(profile, dict) and profile.get("nav_soft"))
+        if not wait_for_grok_com_landing(skip_cf_retry=_nav_soft):
+            print("[Warn] 未能落到 grok.com 登录态，sso 质量可能受影响")
+
+        age_status = ensure_age_gate_completed(timeout=45)
+
+        sso_value = wait_for_sso_cookie()
+        password = str(profile.get("password", "") or "")
+    if isinstance(profile, dict):
+        profile = {**profile, "plan": plan_mode}
+
+    # W3 · SSO 指纹账本去重（重复不算成功，不入队、不占目标）
+    # hybrid 收尾已在 hybrid_register.claim_sso 登记：此处再 claim 会误报 duplicate
+    _hybrid_already_claimed = bool(
+        isinstance(profile, dict) and profile.get("hybrid_done") and sso_value
+    )
+    if sso_value and not _hybrid_already_claimed:
+        try:
+            from sso_ledger import claim_sso
+
+            claim = claim_sso(sso_value, email=email)
+            if claim.get("duplicate"):
+                print(
+                    f"[sso-ledger] ✘ 重复 SSO 指纹={str(claim.get('fingerprint') or '')[:12]}… "
+                    f"first_email={claim.get('email') or '-'} count={claim.get('count')}",
+                    flush=True,
+                )
+                raise AccountRetryNeeded(
+                    f"duplicate SSO fingerprint {str(claim.get('fingerprint') or '')[:16]}"
+                )
+            if claim.get("ok"):
+                print(
+                    f"[sso-ledger] ✔ 新指纹={str(claim.get('fingerprint') or '')[:12]}…",
+                    flush=True,
+                )
+        except AccountRetryNeeded:
+            raise
+        except Exception as le:
+            print(f"[Warn] sso ledger: {le}", flush=True)
+    elif _hybrid_already_claimed:
+        print("[*] hybrid 已 claim SSO，跳过主流程二次入账", flush=True)
+
+    # ZDR：已从注册主路径断开（2026-07-16）。
+    # 模块 register/zdr_toggle.py、account_tags.set_zdr_tag 仍保留，后续研究再接回。
+    # 原逻辑：enable_disable_zdr + disable_zdr_for_sso + set_zdr_tag（见 git 历史）。
+
+    append_sso_to_txt(sso_value, output_path, email=email, password=password)
+
+    # W2 · 捕获 CF 上下文供下一轮复用
+    try:
+        from cf_context import capture_cloudflare_context
+
+        capture_cloudflare_context(
+            page,
+            browser,
+            source="post_register",
+            log=lambda m: print(m, flush=True),
+        )
+    except Exception as cfe:
+        print(f"[Warn] cf capture: {cfe}", flush=True)
+
+    # 授权流水线全部移交后台队列：SSO 推送 / Auth 转换 / Auth 推送
+    # 注册主流程只落盘 SSO，不阻塞下一轮
+    auth_status = {"attempted": False, "ok": False, "queued": False}
+    grok2api_status = {"attempted": False, "ok": False, "queued": False}
+    if sso_value:
+        try:
+            proxy_for_auth = ""
+            try:
+                proxy_for_auth = next_proxy(_browser_proxy) or _browser_proxy or ""
+            except Exception:
+                proxy_for_auth = _browser_proxy or ""
+
+            # 浏览器 UA / CF cookie 随任务带走（队列 SSO→g2 / NSFW 用）
+            # #9：稳定提取 cf_clearance（多域、多 API、document.cookie 兜底）
+            ua_hint = ""
+            cf_hint = ""
+            try:
+                if page is not None:
+                    try:
+                        ua_hint = str(page.run_js("return navigator.userAgent") or "")
+                    except Exception:
+                        pass
+                    cf_map: dict[str, str] = {}
+                    want = ("cf_clearance", "__cf_bm", "sso-rw", "sso")
+
+                    def _ingest(name: str, value: str) -> None:
+                        n = str(name or "").strip()
+                        v = str(value or "").strip()
+                        if not n or not v:
+                            return
+                        key = n.lower()
+                        if key in want and key not in cf_map:
+                            cf_map[key] = f"{n}={v}"
+
+                    # 1) page.cookies() 各种形态
+                    try:
+                        cookies = page.cookies()
+                        if isinstance(cookies, dict):
+                            for k, v in cookies.items():
+                                _ingest(str(k), str(v))
+                        else:
+                            for c in list(cookies or []):
+                                if isinstance(c, dict):
+                                    _ingest(
+                                        str(c.get("name") or c.get("Name") or ""),
+                                        str(c.get("value") or c.get("Value") or ""),
+                                    )
+                    except Exception:
+                        pass
+                    # 2) browser / tab cookies 再扫（Drission 不同版本）
+                    try:
+                        br = getattr(page, "browser", None) or browser
+                        if br is not None:
+                            for getter in (
+                                lambda: br.cookies(),
+                                lambda: br.get_cookies(),
+                                lambda: page.get_cookies(),
+                            ):
+                                try:
+                                    raw = getter()
+                                except Exception:
+                                    continue
+                                if isinstance(raw, dict):
+                                    for k, v in raw.items():
+                                        _ingest(str(k), str(v))
+                                elif isinstance(raw, list):
+                                    for c in raw:
+                                        if isinstance(c, dict):
+                                            _ingest(
+                                                str(c.get("name") or ""),
+                                                str(c.get("value") or ""),
+                                            )
+                    except Exception:
+                        pass
+                    # 3) document.cookie 兜底（当前域）
+                    try:
+                        doc_ck = str(
+                            page.run_js("return document.cookie || ''") or ""
+                        )
+                        for part in doc_ck.split(";"):
+                            part = part.strip()
+                            if "=" not in part:
+                                continue
+                            n, v = part.split("=", 1)
+                            _ingest(n, v)
+                    except Exception:
+                        pass
+                    # 优先顺序输出：cf_clearance 必须在前
+                    ordered = []
+                    for k in want:
+                        if k in cf_map:
+                            ordered.append(cf_map[k])
+                    cf_hint = "; ".join(ordered)
+                    if "cf_clearance=" in cf_hint.lower():
+                        print(
+                            f"[*] 入队 CF cookie 已提取 len={len(cf_hint)} "
+                            f"（含 cf_clearance）",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[Warn] 入队未拿到 cf_clearance（NSFW/g2 可能被 CF 拦）",
+                            flush=True,
+                        )
+            except Exception:
+                pass
+
+            from auth_export_queue import enqueue_authorization
+
+            mint_mode = ""
+            try:
+                with open(
+                    os.path.join(os.path.dirname(__file__), "config.json"),
+                    "r",
+                    encoding="utf-8",
+                ) as _mf:
+                    mint_mode = str(_json_mod.load(_mf).get("cpa_mint_mode") or "").strip()
+            except Exception:
+                mint_mode = ""
+
+            q = enqueue_authorization(
+                sso=sso_value,
+                email=email,
+                password=password,
+                proxy=proxy_for_auth,
+                mint_mode=mint_mode,
+                user_agent=ua_hint,
+                cloudflare_cookies=cf_hint,
+                log=lambda m: print(m, flush=True),
+            )
+            flags = q.get("flags") or {}
+            auth_status = {
+                "attempted": bool(flags.get("auto_auth")),
+                "ok": bool(q.get("queued") or q.get("skipped")),
+                "queued": bool(q.get("queued")),
+                "delay_sec": q.get("delay_sec"),
+                "pending": q.get("pending"),
+                "mint_mode": q.get("mint_mode"),
+                "error": q.get("error"),
+            }
+            grok2api_status = {
+                "attempted": bool(flags.get("sso_g2")),
+                "ok": bool(q.get("queued") or q.get("skipped")),
+                "queued": bool(q.get("queued")),
+                "deferred": True,
+            }
+            if q.get("queued"):
+                print(
+                    f"[*] 注册只交 SSO → 授权队列（mint 不在本轮）· "
+                    f"{q.get('delay_sec')}s 后后台执行 "
+                    f"（SSO推送/Auth转换/Auth推送）· email={email or '-'} "
+                    f"pending≈{q.get('pending')}",
+                    flush=True,
+                )
+            elif q.get("skipped"):
+                print(
+                    f"[*] 授权未入队（自动转换与 SSO 推送均关）· email={email or '-'}",
+                    flush=True,
+                )
+            else:
+                print(f"[Warn] 授权入队失败: {q.get('error')}", flush=True)
+                auth_status["ok"] = False
+                grok2api_status["ok"] = False
+        except Exception as e:
+            print(f"[Warn] 授权入队异常（不影响 sso 落盘）: {e}", flush=True)
+            auth_status = {"attempted": True, "ok": False, "queued": False, "error": str(e)}
+            grok2api_status = {"attempted": False, "ok": False, "error": str(e)[:200]}
+
+    if extract_numbers:
+        extract_visible_numbers()
+
+    result = {
+        "email": email,
+        "sso": sso_value,
+        "age_gate": age_status,
+        "auth": auth_status,
+        "grok2api": grok2api_status,
+        **profile,
+    }
+
+    if run_logger:
+        run_logger.info(
+            "注册成功 | email=%s | password=%s | given=%s | family=%s | age_year=%s | age_ok=%s",
+            email,
+            profile.get("password", ""),
+            profile.get("given_name", ""),
+            profile.get("family_name", ""),
+            age_status.get("birth_year"),
+            age_status.get("submitted"),
+        )
+
+    print(f"[*] 本轮注册完成，邮箱: {email}")
+    return result
+
+
+def load_run_count() -> int:
+    # 从 config.json 读取默认执行轮数，配置不存在时返回 10。
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    try:
+        import json
+        with open(config_path, "r", encoding="utf-8") as f:
+            conf = json.load(f)
+        v = conf.get("run", {}).get("count")
+        if isinstance(v, int) and v >= 0:
+            return v
+    except Exception:
+        pass
+    return 10
+
+
+def main():
+    global run_logger
+    run_logger = setup_run_logger()
+
+    config_count = load_run_count()
+
+    parser = argparse.ArgumentParser(description="Grok 自动注册机")
+    parser.add_argument("--count", type=int, default=config_count, help=f"执行轮数，0 表示无限循环（默认 {config_count}）")
+    parser.add_argument("--output", default=DEFAULT_SSO_FILE, help="sso 输出 txt 路径")
+    parser.add_argument("--extract-numbers", action="store_true", help="注册完成后额外提取页面数字文本")
+    args = parser.parse_args()
+
+    total = args.count if args.count > 0 else '∞'
+    # logger 就绪后再打一次环境摘要，确保 WebUI/日志文件都能看到（不依赖模块 import 时的 print）
+    _emit(
+        f"[*] 运行环境: system={platform.system()} machine={platform.machine()} "
+        f"python={platform.python_version()} DISPLAY={os.environ.get('DISPLAY', '')!r} "
+        f"window={_WINDOW_W}x{_WINDOW_H} headless=False"
+    )
+    _emit(f"[*] 浏览器版本(启动前): {_probe_browser_version()}")
+    print("", flush=True)
+    print("══════════════════════════════════════", flush=True)
+    print(f"  Grok 注册机启动   Build: {_REGISTER_BUILD}", flush=True)
+    print(f"  计划轮数: {total}", flush=True)
+    print(f"  SSO 输出: {args.output}", flush=True)
+    print("══════════════════════════════════════", flush=True)
+
+    # 代理诊断：行首 [proxy] 保证 WebUI 不过滤；开了代理却无节点则停，避免静默直连
+    try:
+        def _mask_proxy_url(u: str) -> str:
+            u = str(u or "").strip()
+            if not u:
+                return ""
+            try:
+                if parse_proxy_url:
+                    p = parse_proxy_url(u)
+                    if p and p.get("has_auth"):
+                        return (
+                            f"{p.get('scheme')}://{str(p.get('username') or '')[:8]}…:***"
+                            f"@{p.get('host')}:{p.get('port')}"
+                        )
+                    if p:
+                        return f"{p.get('scheme')}://{p.get('host')}:{p.get('port')}"
+            except Exception:
+                pass
+            return u.split("@")[-1] if "@" in u else u[:48]
+
+        _cfgp = os.path.join(os.path.dirname(__file__), "config.json")
+        _c0 = {}
+        if os.path.isfile(_cfgp):
+            import json as _j0
+
+            with open(_cfgp, "r", encoding="utf-8") as _f0:
+                _c0 = _j0.load(_f0) or {}
+        def _flag_on_cfg(v, default=False):
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return default
+            s = str(v).strip().lower()
+            if s in ("1", "true", "yes", "on", "enabled"):
+                return True
+            if s in ("0", "false", "no", "off", "disabled", ""):
+                return False
+            return default
+
+        # 不依赖未导入的 proxy_enabled/load_proxy_pool；直接读 config.json
+        _cf0 = _flag_on_cfg(_c0.get("cf_proxy_enabled"), False)
+        _pe0 = _cf0 or _flag_on_cfg(_c0.get("proxy_enabled"), False)
+        _pool_sw0 = (not _cf0) and _flag_on_cfg(_c0.get("proxy_pool_enabled"), False)
+        _pool_raw = _c0.get("proxy_pool")
+        if isinstance(_pool_raw, list):
+            _pool_n0 = len([x for x in _pool_raw if str(x or "").strip()])
+        elif isinstance(_pool_raw, str):
+            _pool_n0 = len(
+                [
+                    ln
+                    for ln in _pool_raw.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+            )
+        else:
+            _pool_n0 = 0
+        _px0 = str(_c0.get("proxy") or "").strip()
+        _bpx0 = str(_c0.get("browser_proxy") or "").strip()
+        _diag0 = _c0.get("_proxy_diag") if isinstance(_c0.get("_proxy_diag"), dict) else {}
+        if _diag0:
+            print(
+                f"[proxy] writeConfig mode={_diag0.get('mode')} "
+                f"enabled={_diag0.get('proxy_enabled')} pool_n={_diag0.get('pool_n')} "
+                f"single={_diag0.get('has_proxy')} browser={_diag0.get('has_browser_proxy')}"
+                + (" auto_pool_fallback=1" if _diag0.get("auto_pool_fallback") else ""),
+                flush=True,
+            )
+        if _cf0:
+            print(
+                f"[proxy] 模式=CF独立 local={_mask_proxy_url(_px0 or _bpx0) or '-'} "
+                f"domain={_c0.get('cf_proxy_domain') or '-'} → set_proxy 本地 cfwp",
+                flush=True,
+            )
+        elif not _pe0:
+            print(
+                "[proxy] 模式=直连 (proxy_enabled=false)。"
+                "若界面勾了代理仍见此行：请保存设置后重新启动注册。",
+                flush=True,
+            )
+        elif _pool_sw0 or _pool_n0 > 0:
+            print(
+                f"[proxy] 模式=代理池 switch={_pool_sw0} 可用={_pool_n0} 条 "
+                f"→ 每轮 acquire/next_proxy",
+                flush=True,
+            )
+            if _pool_n0 <= 0:
+                print(
+                    "[proxy][!] 代理池已开但可用 IP=0 → 停止，避免误直连。"
+                    "请导入可用池或关闭「使用代理池」并填单条。",
+                    flush=True,
+                )
+                raise SystemExit(2)
+        elif _px0 or _bpx0:
+            print(
+                f"[proxy] 模式=单条 proxy={_mask_proxy_url(_px0) or '-'} "
+                f"browser_proxy={_mask_proxy_url(_bpx0) or '-'} → set_proxy/本地转发",
+                flush=True,
+            )
+        else:
+            print(
+                "[proxy][!] 已启用代理，但 config 无 proxy / browser_proxy / proxy_pool。"
+                "停止注册，避免误直连。请填写单条或导入可用池后保存再启动。",
+                flush=True,
+            )
+            raise SystemExit(2)
+    except SystemExit:
+        raise
+    except Exception as _pe_log:
+        print(f"[proxy][!] 代理模式摘要失败: {_pe_log}", flush=True)
+
+    current_round = 0
+    success_count = 0
+    fail_count = 0
+    collected_sso: list = []
+    recycle_every = 5
+    try:
+        import json as _json_mod
+        from runtime_gc import load_recycle_every, cleanup_runtime_memory, clear_temp_profiles
+
+        conf_rt = {}
+        try:
+            with open(
+                os.path.join(os.path.dirname(__file__), "config.json"),
+                "r",
+                encoding="utf-8",
+            ) as _rf:
+                conf_rt = _json_mod.load(_rf) or {}
+        except Exception:
+            conf_rt = {}
+        recycle_every = load_recycle_every(conf_rt)
+        try:
+            # 启动自检：quiet 仅 FAIL 才输出（不刷 PASS 列表）
+            from optimization_checks import main as _opt_main
+
+            _code = _opt_main(quiet=True)
+            if _code != 0:
+                print("[Warn] 自检有 FAIL 项，继续运行", flush=True)
+        except Exception as oe:
+            print(f"[Warn] 自检跳过: {oe}", flush=True)
+        try:
+            from tab_pool import TabPool
+
+            TabPool.init(_new_chromium_options, log_callback=None)
+        except Exception as te:
+            print(f"[Warn] TabPool 初始化跳过: {te}", flush=True)
+        # 启动 GC / 清临时：成功静默，失败才打日志
+        cleanup_runtime_memory(
+            log=lambda m: print(m, flush=True), force=True, silent_ok=True
+        )
+        clear_temp_profiles(log=None)
+    except Exception as ge:
+        print(f"[Warn] runtime_gc 初始化: {ge}", flush=True)
+
+    # 代理池模式：可用池无 IP → 直接停止（不进入注册循环）
+    try:
+        import json as _j_pool_guard
+
+        def _flag_on(raw, default=True) -> bool:
+            if raw is None:
+                return bool(default)
+            if isinstance(raw, bool):
+                return raw
+            s = str(raw).strip().lower()
+            if s in ("0", "false", "no", "off", "disabled"):
+                return False
+            if s in ("1", "true", "yes", "on", "enabled"):
+                return True
+            return bool(default)
+
+        _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+        _cg = {}
+        if os.path.isfile(_cfg_path):
+            with open(_cfg_path, "r", encoding="utf-8") as _fg:
+                _cg = _j_pool_guard.load(_fg) or {}
+        _master = _flag_on(_cg.get("proxy_enabled"), True)
+        # 必须显式开池（writeConfig 在 UI 开「使用代理池」时写 true）
+        _pool_on = _flag_on(_cg.get("proxy_pool_enabled"), False)
+        if _master and _pool_on:
+            _pp = _cg.get("proxy_pool") or _cg.get("proxies") or []
+            if not isinstance(_pp, list):
+                _pp = [_pp] if _pp else []
+            _alive = [
+                str(x).strip()
+                for x in _pp
+                if str(x or "").strip() and not str(x).strip().startswith("#")
+            ]
+            if not _alive:
+                print(
+                    "[Stop] 代理池模式已开启，但可用池内无代理 IP。"
+                    "请先测活迁入可用池，或关闭「使用代理池」/「启用代理」。",
+                    flush=True,
+                )
+                raise SystemExit(2)
+    except SystemExit:
+        raise
+    except Exception as _pg_e:
+        print(f"[Warn] 可用池检查跳过: {_pg_e}", flush=True)
+
+    # 注册方案：启动时读一次 config，全任务期间不变；日志只打一次
+    try:
+        from plan_b import (
+            load_plan_a_enabled_from_config,
+            load_plan_b_enabled_from_config,
+            load_plan_c_enabled_from_config,
+            load_plan_order_from_config,
+        )
+
+        plan_a_enabled = load_plan_a_enabled_from_config()
+        plan_b_enabled = load_plan_b_enabled_from_config()
+        plan_c_enabled = load_plan_c_enabled_from_config()
+        plan_order = load_plan_order_from_config()
+    except Exception:
+        plan_a_enabled = True
+        plan_b_enabled = True
+        plan_c_enabled = False
+        plan_order = ["A", "B", "C"]
+    # 机器可读 on/off，前端渲染为「本轮启用Plan: A B C」且启绿禁红
+    print(
+        f"[plan] 本轮启用Plan: A:{'on' if plan_a_enabled else 'off'} "
+        f"B:{'on' if plan_b_enabled else 'off'} "
+        f"C:{'on' if plan_c_enabled else 'off'} "
+        f"order={'>'.join(plan_order)}",
+        flush=True,
+    )
+
+    force_browser_recycle = True  # 首轮必须新起浏览器
+    try:
+        while True:
+            if args.count > 0 and current_round >= args.count:
+                break
+
+            current_round += 1
+            print(f"")
+            # 首轮 / 失败后 / 每 N 成功：完整 quit+restart；否则 clear_session 复用进程
+            do_full_restart = force_browser_recycle or browser is None
+            if do_full_restart:
+                try:
+                    from cf_context import clear_thread_cf_context
+
+                    # 完整重启浏览器后 CF 与 TLS/IP 失效，丢弃
+                    clear_thread_cf_context()
+                except Exception:
+                    pass
+                try:
+                    stop_browser()
+                except Exception:
+                    pass
+                try:
+                    from tab_pool import TabPool
+
+                    TabPool.release_tab()
+                except Exception:
+                    pass
+                start_browser()
+                force_browser_recycle = False
+            else:
+                # W2 · 复用：清身份 + 恢复 CF（不清掉 cf_clearance）
+                cleared = False
+                try:
+                    from cf_context import clear_identity_keep_cf, clear_thread_cf_context
+
+                    if page is not None:
+                        cleared = clear_identity_keep_cf(
+                            page,
+                            browser,
+                            log=lambda m: print(m, flush=True),
+                        )
+                    try:
+                        from tab_pool import TabPool
+
+                        # TabPool 全清 cookie 后立刻 restore 线程内 CF
+                        TabPool.clear_session()
+                        try:
+                            from cf_context import restore_cloudflare_context
+
+                            restore_cloudflare_context(
+                                page, log=lambda m: print(m, flush=True)
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    if cleared:
+                        print("[*] 浏览器会话已清理（复用进程，已保 CF）", flush=True)
+                        # 复用进程也刷新指纹（关键：换 noise_seed，canvas/audio
+                        # 哈希逐号不同），消除「5 个一组同指纹」的跨号关联簇。
+                        try:
+                            _regen_fingerprint_for_reuse(page)
+                        except Exception as _fe:
+                            print(f"[Warn] 复用指纹刷新跳过: {_fe}", flush=True)
+                except Exception as ce:
+                    print(f"[Warn] clear_session 失败，改为重启: {ce}", flush=True)
+                    cleared = False
+                    try:
+                        from cf_context import clear_thread_cf_context
+
+                        clear_thread_cf_context()
+                    except Exception:
+                        pass
+                if not cleared:
+                    try:
+                        from cf_context import clear_thread_cf_context
+
+                        clear_thread_cf_context()
+                    except Exception:
+                        pass
+                    try:
+                        stop_browser()
+                    except Exception:
+                        pass
+                    start_browser()
+            # start_browser 内已打指纹；仅首轮详打一次（避免双份）
+            log_runtime_fingerprint(page, force=False)
+            # 不打印「本轮代理」（省日志；代理异常时仍有降级/切换行）
+            print(
+                f"─── 第 {current_round}/{total} 轮 ────────────────────────"
+                f"（recycle_every={recycle_every} restart={do_full_restart}）"
+            )
+
+            used_plan = ""
+            result = None
+            last_err: Exception | None = None
+            err_parts: list[str] = []
+
+            if not (plan_a_enabled or plan_b_enabled or plan_c_enabled):
+                fail_count += 1
+                print(
+                    f"✘ 第 {current_round} 轮跳过：注册方案 A/B/C 均已关闭，请在「注册方案」中至少开启一项"
+                )
+                if args.count == 0 or current_round < args.count:
+                    time.sleep(0.5)
+                continue
+
+            def _is_hard_proxy_fail(err: BaseException | str | None) -> bool:
+                """A 因代理/网络硬失败时，B 拟人兜底无意义（同一坏链路）。"""
+                s = str(err or "").lower()
+                keys = (
+                    "chrome-error",
+                    "chromewebdata",
+                    "can't be reached",
+                    "can’t be reached",
+                    "代理/网络不可达",
+                    "代理/隧道错误",
+                    "注册页无法访问",
+                    "连续硬失败",
+                    "err_proxy",
+                    "err_tunnel",
+                    "err_connection",
+                    "err_timed_out",
+                    "err_name_not_resolved",
+                )
+                return any(k in s for k in keys)
+
+            # ---------- Plans by register_plan_order (default A→B→C) ----------
+            plan_enabled = {
+                "A": bool(plan_a_enabled),
+                "B": bool(plan_b_enabled),
+                "C": bool(plan_c_enabled),
+            }
+            _abort_rounds = False
+            for plan_key in plan_order:
+                if result is not None or _abort_rounds:
+                    break
+                pk = str(plan_key or "").strip().upper()
+                if pk not in plan_enabled or not plan_enabled[pk]:
+                    continue
+
+                if pk == "A":
+                    try:
+                        print("═══ Plan A 注册开始 ═══")
+                        result = run_single_registration(
+                            args.output, extract_numbers=args.extract_numbers, plan="a"
+                        )
+                        used_plan = "a"
+                    except KeyboardInterrupt:
+                        print("")
+                        print("[Info] 收到中断信号，停止后续轮次。")
+                        _abort_rounds = True
+                        break
+                    except AccountRetryNeeded as e:
+                        last_err = e
+                        err_parts.append(f"A:retry:{str(e)[:50]}")
+                        print(f"[plan-a] ⟳ 可重试: {e}")
+                    except Exception as e:
+                        last_err = e
+                        err_parts.append(f"A:{str(e)[:60]}")
+                        print(f"[plan-a] ✘ 失败: {e}")
+                    continue
+
+                if pk == "B":
+                    # 硬代理失败跳过 B：拟人无法打通 can't be reached
+                    if _is_hard_proxy_fail(last_err):
+                        print(
+                            "[plan-b] 跳过：上一方案为代理/网络硬失败（chrome-error），"
+                            "拟人兜底无效；已/将降级代理后进入下一方案或下一轮",
+                            flush=True,
+                        )
+                        err_parts.append("B:skipped_hard_proxy")
+                        continue
+                    try:
+                        print("═══ Plan B 注册开始 ═══")
+                        try:
+                            stop_browser()
+                        except Exception:
+                            pass
+                        time.sleep(0.5 + secrets.randbelow(40) / 100.0)
+                        start_browser()
+                        log_runtime_fingerprint(page, force=False)
+                        result = run_single_registration(
+                            args.output,
+                            extract_numbers=args.extract_numbers,
+                            plan="b",
+                        )
+                        used_plan = "b"
+                    except KeyboardInterrupt:
+                        print("")
+                        print("[Info] 收到中断信号，停止后续轮次。")
+                        _abort_rounds = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        err_parts.append(f"B:{str(e)[:60]}")
+                        print(f"[plan-b] ✘ 失败: {e}")
+                    continue
+
+                if pk == "C":
+                    try:
+                        from hybrid_register import run_hybrid_registration
+
+                        print("═══ Plan C 注册开始 ═══")
+                        hy = run_hybrid_registration(
+                            args.output, extract_numbers=args.extract_numbers
+                        )
+                        if hy and hy.get("sso"):
+                            result = hy
+                            used_plan = "c"
+                        else:
+                            detail = ""
+                            if isinstance(hy, dict):
+                                detail = str(hy.get("error") or "").strip()
+                            msg = detail if detail else "hybrid 未返回 sso"
+                            err_parts.append(f"C:{msg[:80]}")
+                            print(f"[plan-c] ✘ {msg}")
+                    except KeyboardInterrupt:
+                        print("")
+                        print("[Info] 收到中断信号，停止后续轮次。")
+                        _abort_rounds = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        err_parts.append(f"C:{str(e)[:60]}")
+                        print(f"[plan-c] ✘ 失败: {e}")
+                    continue
+
+            if _abort_rounds:
+                break
+
+            if result is None:
+                fail_count += 1
+                detail = " | ".join(err_parts) if err_parts else str(last_err or "全部方案失败")
+                print(f"✘ 第 {current_round} 轮失败/跳过（{detail}）")
+                try:
+                    from pools import demote_proxy_to_pending
+
+                    if _browser_proxy:
+                        demote_proxy_to_pending(
+                            _browser_proxy,
+                            reason=f"注册失败:{detail[:40]}",
+                        )
+                except Exception as de:
+                    print(f"[Warn] 失败降级回调异常: {de}")
+            else:
+                collected_sso.append(result["sso"])
+                success_count += 1
+                tag = (
+                    "Plan C"
+                    if used_plan == "c"
+                    else ("Plan B" if used_plan == "b" else "Plan A")
+                )
+                # 邮箱已在「注册成功 | email=…」行输出，此处不再重复
+                print(f"✔ 第 {current_round} 轮成功（{tag}）")
+                # P2/3：成功后 GC；每 N 成功强制下轮重启浏览器
+                try:
+                    from runtime_gc import on_register_success
+
+                    gr = on_register_success(
+                        recycle_every=recycle_every,
+                        log=lambda m: print(m, flush=True),
+                    )
+                    if gr.get("need_browser_recycle"):
+                        force_browser_recycle = True
+                        print(
+                            f"[gc] 下轮将强制重启浏览器（成功累计达 recycle_every={recycle_every}）",
+                            flush=True,
+                        )
+                except Exception as ge:
+                    print(f"[Warn] GC 回调: {ge}", flush=True)
+
+            if result is None:
+                # 失败也做轻量 GC，下轮重启浏览器
+                force_browser_recycle = True
+                try:
+                    from runtime_gc import cleanup_runtime_memory
+
+                    cleanup_runtime_memory(
+                        log=lambda m: print(m, flush=True), force=False
+                    )
+                except Exception:
+                    pass
+
+            if args.count == 0 or current_round < args.count:
+                # 注册间隔：0=不等待；1～60 固定分钟；61=随机 25～50 分钟
+                try:
+                    _iv_sec, _iv_label = _resolve_register_interval_sec()
+                except Exception:
+                    _iv_sec, _iv_label = 60, "1 分钟"
+                if _iv_sec <= 0:
+                    print("[*] 注册间隔 0 · 立即下一轮", flush=True)
+                    time.sleep(0.5)
+                else:
+                    print(
+                        f"[*] 注册间隔 {_iv_label}（{_iv_sec}s）后开始下一轮…",
+                        flush=True,
+                    )
+                    time.sleep(_iv_sec)
+
+
+    finally:
+        stop_browser()
+        # 后台 SSO→Auth 队列：默认短等，避免 mint 拖住「注册结束」；
+        # auth_queue_exit_wait_sec=0 则只汇报 pending、不阻塞退出。
+        try:
+            from auth_export_queue import queue_stats, wait_queue_idle
+
+            st = queue_stats()
+            pending = int(st.get("pending", 0) or 0)
+            qsize = int(st.get("queue_size", 0) or 0)
+            if pending > 0 or qsize > 0:
+                wait_cap = 45.0
+                try:
+                    import json as _jq
+                    _cp = os.path.join(os.path.dirname(__file__), "config.json")
+                    if os.path.isfile(_cp):
+                        with open(_cp, "r", encoding="utf-8") as _cf:
+                            _c = _jq.load(_cf) or {}
+                        if "auth_queue_exit_wait_sec" in _c:
+                            wait_cap = float(_c.get("auth_queue_exit_wait_sec"))
+                        elif "authQueueExitWaitSec" in _c:
+                            wait_cap = float(_c.get("authQueueExitWaitSec"))
+                        else:
+                            from auth_export_queue import load_delay_range
+
+                            _lo, _hi = load_delay_range()
+                            # 短余量：注册交付 SSO 后不再为 mint 长等
+                            wait_cap = min(90.0, float(_hi) + 30.0)
+                except Exception:
+                    wait_cap = 45.0
+                wait_cap = max(0.0, min(float(wait_cap), 600.0))
+                if wait_cap <= 0:
+                    print(
+                        f"[auth-queue] 注册结束 · 后台队列仍在跑 "
+                        f"（pending≈{pending} size≈{qsize}）· 不等待 mint",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[auth-queue] 注册结束，短等后台队列 "
+                        f"（pending≈{pending} · 最长 {wait_cap:.0f}s；"
+                        f"mint 已与注册解耦）…",
+                        flush=True,
+                    )
+                    ok = wait_queue_idle(timeout=wait_cap)
+                    st2 = queue_stats()
+                    print(
+                        f"[auth-queue] 队列{'已清空' if ok else '超时仍有剩余'}"
+                        f" · ok={st2.get('done_ok')} fail={st2.get('done_fail')}"
+                        f" pending≈{st2.get('pending')}",
+                        flush=True,
+                    )
+        except Exception as qe:
+            print(f"[Warn] 等待 auth 队列异常: {qe}", flush=True)
+        print(f"")
+        print(f"══════════════════════════════════════")
+        print(f"  注册机运行结束")
+        print(f"成功: {success_count}  失败: {fail_count}  共计: {current_round}")
+        if collected_sso:
+            print(f"  SSO 已保存到: {args.output}")
+        print(f"══════════════════════════════════════")
+
+
+if __name__ == "__main__":
+    main()

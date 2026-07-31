@@ -1,0 +1,46 @@
+# 本地源码构建镜像（开发/调试用）。
+# 生产环境请使用仓库根目录 docker-compose.yml 拉取 GHCR 镜像。
+#
+#   cd docker
+#   cp .env.example .env
+#   docker compose up -d --build
+#
+# 热更新：修改仓库根目录 register/ 后 docker compose restart 即可同步。
+
+services:
+  grok-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: grok-agent:beta
+    container_name: grok-agent
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-6657}:6657"
+    environment:
+      PORT: "6657"
+      BIND_HOST: "0.0.0.0"
+      STATIC_ROOT: "/app/out/renderer"
+      DATA_DIR: "/data"
+      PYTHON_PATH: "/usr/local/bin/python3"
+      REGISTER_DIR: "/app/register"
+      REGISTER_HOST_SRC: "/opt/register-host"
+      REGISTER_SEED: "/opt/register-seed"
+      SSO_DIR: "/data/sso"
+      MAIL_PROVIDER: "${MAIL_PROVIDER:-}"
+      MAIL_API_BASE: "${MAIL_API_BASE:-}"
+      MAIL_ADMIN_AUTH: "${MAIL_ADMIN_AUTH:-}"
+      MAIL_DOMAIN: "${MAIL_DOMAIN:-}"
+      REMAIL_PROJECT_ID: "${REMAIL_PROJECT_ID:-}"
+      REMAIL_PRODUCT_ID: "${REMAIL_PRODUCT_ID:-}"
+      REMAIL_EMAIL_SUFFIXES: "${REMAIL_EMAIL_SUFFIXES:-}"
+      RUN_COUNT: "${RUN_COUNT:-10}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      BROWSER_PROXY: "${BROWSER_PROXY:-}"
+      BROWSER_PATH: "/usr/bin/chromium"
+      COOKIE_SECURE: "${COOKIE_SECURE:-}"
+      DISPLAY: ":99"
+    volumes:
+      - ./data:/data
+      - ../register:/opt/register-host:ro
+    shm_size: "1gb"

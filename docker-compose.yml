@@ -1,0 +1,65 @@
+# 生产部署：直接拉取 GHCR 镜像。
+# 本地源码构建请使用 docker/docker-compose.yml。
+#
+#   cp .env.example .env
+#   docker compose pull
+#   docker compose up -d --remove-orphans
+#
+# 可选 Solver:
+#   docker compose --profile solver pull
+#   docker compose --profile solver up -d
+
+services:
+  grok-register-agent:
+    image: ghcr.io/murasamecyan/grokregisteragent:beta
+    container_name: grok-register-agent
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-6657}:6657"
+    environment:
+      PORT: "6657"
+      BIND_HOST: "0.0.0.0"
+      STATIC_ROOT: "/app/out/renderer"
+      DATA_DIR: "/data"
+      PYTHON_PATH: "/usr/local/bin/python3"
+      REGISTER_DIR: "/app/register"
+      REGISTER_HOST_SRC: "/opt/register-host"
+      REGISTER_SEED: "/opt/register-seed"
+      SSO_DIR: "/data/sso"
+      MAIL_PROVIDER: "${MAIL_PROVIDER:-}"
+      MAIL_API_BASE: "${MAIL_API_BASE:-}"
+      MAIL_ADMIN_AUTH: "${MAIL_ADMIN_AUTH:-}"
+      MAIL_DOMAIN: "${MAIL_DOMAIN:-}"
+      REMAIL_PROJECT_ID: "${REMAIL_PROJECT_ID:-}"
+      REMAIL_PRODUCT_ID: "${REMAIL_PRODUCT_ID:-}"
+      REMAIL_EMAIL_SUFFIXES: "${REMAIL_EMAIL_SUFFIXES:-}"
+      RUN_COUNT: "${RUN_COUNT:-10}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      BROWSER_PROXY: "${BROWSER_PROXY:-}"
+      BROWSER_PATH: "/usr/bin/chromium"
+      COOKIE_SECURE: "${COOKIE_SECURE:-}"
+      DISPLAY: ":99"
+      TURNSTILE_SOLVER_ENABLED: "${TURNSTILE_SOLVER_ENABLED:-0}"
+      TURNSTILE_SOLVER_URL: "${TURNSTILE_SOLVER_URL:-http://turnstile-solver:5072}"
+      YESCAPTCHA_KEY: "${YESCAPTCHA_KEY:-}"
+    volumes:
+      - ./data:/data
+    shm_size: "1gb"
+
+  # 可选：Turnstile Solver（默认不拉取/不启动）
+  turnstile-solver:
+    profiles: ["solver"]
+    image: ghcr.io/murasamecyan/grok-turnstile-solver:beta
+    container_name: grok-turnstile-solver
+    restart: unless-stopped
+    expose:
+      - "5072"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "5072"
+      THREAD: "${TURNSTILE_SOLVER_THREADS:-2}"
+      BROWSER_TYPE: "${TURNSTILE_SOLVER_BROWSER:-chromium}"
+      DEBUG: "${TURNSTILE_SOLVER_DEBUG:-0}"
+      PROXY: "${TURNSTILE_SOLVER_PROXY:-0}"
+      DISPLAY: ":99"
+    shm_size: "1gb"

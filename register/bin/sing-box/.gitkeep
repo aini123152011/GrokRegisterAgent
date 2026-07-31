@@ -1,0 +1,4 @@
+# sing-box Linux 客户端不入库。
+# 官方镜像由 GitHub Actions 构建：工作流调用 scripts/fetch-sing-box.sh
+# 下载到本目录 linux-amd64 / linux-arm64 后再 docker build 打进镜像。
+# 用户请拉取 ghcr.io 镜像，无需本地下载或自行构建。

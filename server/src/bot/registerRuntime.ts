@@ -1,0 +1,704 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import type { AppSettings } from '@shared/settings';
+import {
+  buildSingBoxLocalProxyUrl,
+  parseStringList
+} from '@shared/settings';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+export const REGISTER_SCRIPT_NAMES = ['runner.py', 'DrissionPage_example.py'] as const;
+
+/**
+ * 跨进程写 config.json 的文件锁：与 Python pools.py 的 _CrossProcConfigLock
+ * 共用同名 config.json.lock，通过 O_CREAT|O_EXCL 自旋获取，避免半写文件与
+ * 互相覆盖。超时放行（宁可偶发覆盖也不卡死）；陈旧锁（崩溃残留）直接接管。
+ */
+function acquireConfigLock(configPath: string, timeoutMs = 5000, staleMs = 30000): number | null {
+  const lockPath = `${configPath}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      try {
+        fs.writeSync(fd, String(process.pid));
+      } catch {
+        /* pid 写失败不影响锁语义 */
+      }
+      return fd;
+    } catch (err: any) {
+      if (err?.code !== 'EEXIST') {
+        // 平台异常等：放行，仅靠原子写降低损坏面
+        return null;
+      }
+      try {
+        const st = fs.statSync(lockPath);
+        if (Date.now() - st.mtimeMs > staleMs) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        // 锁刚被释放：重试获取
+        continue;
+      }
+      if (Date.now() >= deadline) return null;
+      // 忙等一小段（Node 无 sleep，用 Atomics 阻塞当前线程）
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+}
+
+function releaseConfigLock(configPath: string, fd: number | null): void {
+  if (fd === null) return;
+  try {
+    fs.closeSync(fd);
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.unlinkSync(`${configPath}.lock`);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 原子写 config.json：写临时文件后 rename，避免读者读到半写内容。 */
+function atomicWriteConfig(configPath: string, config: unknown): void {
+  const tmp = `${configPath}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf-8');
+  fs.renameSync(tmp, configPath);
+}
+
+type RuntimeSettings = Partial<AppSettings>;
+
+export interface RegisterRuntime {
+  registerDir: string;
+  scriptPath: string;
+  entrypoint: string;
+  pythonPath: string;
+}
+
+function addCandidate(candidates: string[], value?: string) {
+  const normalized = normalizeRegisterPath(value);
+  if (!normalized) return;
+
+  const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  const exists = candidates.some((item) => {
+    const itemKey = process.platform === 'win32' ? item.toLowerCase() : item;
+    return itemKey === key;
+  });
+  if (!exists) candidates.push(normalized);
+}
+
+function normalizeRegisterPath(value?: string): string {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) return '';
+
+  const resolved = path.resolve(trimmed);
+  const basename = path.basename(resolved);
+  if (REGISTER_SCRIPT_NAMES.includes(basename as (typeof REGISTER_SCRIPT_NAMES)[number])) {
+    return path.dirname(resolved);
+  }
+
+  return resolved;
+}
+
+/** 多行 / 逗号分隔 → 去重列表（通用，不含代理 # 备注剥离） */
+function parseList(raw?: string): string[] {
+  return parseStringList(raw);
+}
+
+export function findRegisterScript(registerDir: string): string | null {
+  for (const name of REGISTER_SCRIPT_NAMES) {
+    const scriptPath = path.join(registerDir, name);
+    if (fs.existsSync(scriptPath)) return scriptPath;
+  }
+  return null;
+}
+
+export function buildRegisterDirCandidates(configured?: string): string[] {
+  const candidates: string[] = [];
+
+  addCandidate(candidates, configured);
+  addCandidate(candidates, process.env.REGISTER_DIR);
+
+  // 内置注册机优先，旧的 grok-register 外部目录只作为本地兼容回退。
+  addCandidate(candidates, '/app/register');
+  addCandidate(candidates, path.resolve(process.cwd(), 'register'));
+  addCandidate(candidates, path.resolve(__dirname, '..', '..', '..', 'register'));
+  addCandidate(candidates, path.resolve(__dirname, '..', '..', '..', '..', 'register'));
+  addCandidate(candidates, path.resolve(__dirname, '..', '..', '..', '..', '..', 'register'));
+  addCandidate(candidates, path.resolve(process.cwd(), 'grok-register'));
+  addCandidate(candidates, path.resolve(process.cwd(), '..', 'grok-register'));
+  addCandidate(candidates, path.resolve(process.cwd(), '..', 'grok-register-main'));
+
+  return candidates;
+}
+
+export function resolveRegisterRuntime(settings: RuntimeSettings = {}): RegisterRuntime | null {
+  for (const registerDir of buildRegisterDirCandidates(settings.registerDir)) {
+    const scriptPath = findRegisterScript(registerDir);
+    if (!scriptPath) continue;
+
+    return {
+      registerDir,
+      scriptPath,
+      entrypoint: path.basename(scriptPath),
+      pythonPath:
+        settings.pythonPath ||
+        process.env.PYTHON_PATH ||
+        (process.platform === 'win32' ? 'python' : '/usr/local/bin/python3')
+    };
+  }
+
+  return null;
+}
+
+export function writeConfigForPython(registerDir: string, settings: RuntimeSettings, count?: number) {
+  const configPath = path.join(registerDir, 'config.json');
+  // 持跨进程锁完成 read-modify-write：与 Python pools.py 并发写 config.json 时
+  // 避免读到半写文件或互相覆盖。
+  const lockFd = acquireConfigLock(configPath);
+  try {
+    writeConfigForPythonLocked(registerDir, configPath, settings, count);
+  } finally {
+    releaseConfigLock(configPath, lockFd);
+  }
+}
+
+function writeConfigForPythonLocked(
+  registerDir: string,
+  configPath: string,
+  settings: RuntimeSettings,
+  count?: number
+) {
+  let config: Record<string, any> = {};
+
+  try {
+    if (fs.existsSync(configPath)) {
+      config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    }
+  } catch {
+    config = {};
+  }
+
+  // 规范化：去掉尾斜杠与误填的 /admin|/api 后缀（否则 POST 会 405）
+  let mailBase = String(settings.mail?.apiBase || '').trim().replace(/\/+$/, '');
+  for (const suffix of ['/admin/new_address', '/admin', '/api/mails', '/api']) {
+    if (mailBase.toLowerCase().endsWith(suffix)) {
+      mailBase = mailBase.slice(0, -suffix.length).replace(/\/+$/, '');
+    }
+  }
+  config.mail_api_base = mailBase;
+  config.mail_admin_auth = settings.mail?.adminAuth || '';
+  config.mail_domain = String(settings.mail?.domain || '')
+    .trim()
+    .replace(/^@+/, '');
+  // 邮件 API 是否走代理（默认 false）。sing-box 代理常把 mail worker 请求 reset（curl 35），
+  // 关掉后邮件 API 直连、仅浏览器/注册流量走代理。
+  config.mail_api_use_proxy = settings.mail?.useProxy === true;
+
+  // 邮箱提供方：cloudflare | duckmail | yyds | gptmail | remail
+  const mailProvider = String(
+    (settings as { mailProvider?: string }).mailProvider || 'cloudflare'
+  )
+    .trim()
+    .toLowerCase();
+  if (mailProvider === 'duckmail' || mailProvider === 'duck') {
+    config.mail_provider = 'duckmail';
+  } else if (mailProvider === 'yyds' || mailProvider === 'yydsmail') {
+    config.mail_provider = 'yyds';
+  } else if (
+    mailProvider === 'gptmail' ||
+    mailProvider === 'gpt' ||
+    mailProvider === 'chatgpt_mail' ||
+    mailProvider === 'chatgpt-mail'
+  ) {
+    config.mail_provider = 'gptmail';
+  } else if (mailProvider === 'remail') {
+    config.mail_provider = 'remail';
+  } else {
+    config.mail_provider = 'cloudflare';
+  }
+
+  // Remail: POST /v1/open/orders?serviceMode=code 需要 projectId + productId。
+  if (config.mail_provider === 'remail') {
+    const remailProjectId = Number((settings as { remailProjectId?: number }).remailProjectId);
+    const remailProductId = Number((settings as { remailProductId?: number }).remailProductId);
+    config.remail_project_id =
+      Number.isInteger(remailProjectId) && remailProjectId > 0 ? remailProjectId : 0;
+    config.remail_product_id =
+      Number.isInteger(remailProductId) && remailProductId > 0 ? remailProductId : 0;
+    const suffixes = Array.isArray((settings as { remailEmailSuffixes?: unknown }).remailEmailSuffixes)
+      ? ((settings as { remailEmailSuffixes?: unknown[] }).remailEmailSuffixes || [])
+          .map((x) => String(x || '').trim().replace(/^@+/, ''))
+          .filter(Boolean)
+      : [];
+    if (suffixes.length > 0) {
+      config.remail_email_suffixes = Array.from(new Set(suffixes));
+    } else {
+      delete config.remail_email_suffixes;
+    }
+  } else {
+    delete config.remail_project_id;
+    delete config.remail_product_id;
+    delete config.remail_email_suffixes;
+  }
+
+  // 域名池：仅 Cloudflare Temp Email 支持客户端多域名轮换。
+  // DuckMail / YYDS 由服务端分配域名，无对等「本机域名池」接口 → 强制不写 mail_domains。
+  const domainsText = String(settings.mailDomains || '').trim();
+  const isCfMail = config.mail_provider === 'cloudflare';
+  const mailPoolOn =
+    isCfMail &&
+    (settings.mailDomainPoolEnabled === true ||
+      (settings.mailDomainPoolEnabled !== false && domainsText.length > 0));
+  const domains = mailPoolOn ? parseList(settings.mailDomains) : [];
+  if (domains.length > 0) {
+    config.mail_domains = domains;
+  } else {
+    delete config.mail_domains;
+  }
+  config.mail_domain_mode = isCfMail
+    ? settings.mailDomainMode || 'round_robin'
+    : 'round_robin';
+  config.email_domain_mode = config.mail_domain_mode;
+
+  // 代理二模式：sing-box > 直连（普通代理/池 与 CF 独立已移除）
+  const sbOn = (settings as { singBoxEnabled?: boolean }).singBoxEnabled === true;
+  const sbLocalUrl = sbOn
+    ? buildSingBoxLocalProxyUrl({
+        singBoxPort: 2080
+      })
+    : '';
+
+  config.proxy_enabled = sbOn;
+  config.proxy_pool_enabled = false;
+  config.cf_proxy_enabled = false;
+  config.singbox_enabled = sbOn;
+  delete config.cf_proxy_domain;
+  delete config.cf_proxy_port;
+  delete config.cf_proxy_local_scheme;
+  if (sbOn) {
+    config.singbox_port = 2080;
+    config.singbox_selected = String(
+      (settings as { singBoxSelected?: string }).singBoxSelected || '__random__'
+    );
+    config.proxy = sbLocalUrl;
+    config.browser_proxy = sbLocalUrl;
+    delete config.proxy_pool;
+  } else {
+    delete config.singbox_port;
+    delete config.singbox_selected;
+    config.proxy = '';
+    config.browser_proxy = '';
+    delete config.proxy_pool;
+  }
+  config.proxy_mode = settings.proxyMode || 'round_robin';
+
+  const proxyDiag = {
+    mode: sbOn ? 'singbox' : 'direct',
+    proxy_enabled: sbOn,
+    proxy_pool_enabled: false,
+    pool_n: 0,
+    has_proxy: !!String(config.proxy || '').trim(),
+    has_browser_proxy: !!String(config.browser_proxy || '').trim(),
+    auto_pool_fallback: false
+  };
+  (config as { _proxy_diag?: typeof proxyDiag })._proxy_diag = proxyDiag;
+  try {
+    console.log(
+      `[writeConfig] proxy mode=${proxyDiag.mode} enabled=${proxyDiag.proxy_enabled} ` +
+        `single=${proxyDiag.has_proxy} browser=${proxyDiag.has_browser_proxy}`
+    );
+  } catch {
+    /* ignore */
+  }
+
+  config.browser_path = settings.browserPath || '';
+  // 带认证代理：默认优先本地转发（settings 默认 true）
+  config.proxy_prefer_local_forward =
+    settings.proxyPreferLocalForward === undefined
+      ? true
+      : settings.proxyPreferLocalForward === true;
+
+  // 同一出口注册间隔（秒）；0=不限制。仅 sing-box 节点池模式生效：
+  // 直连/单代理下没有出口轮换，冷却只会白拖慢注册，故强制 0。
+  const ipInterval = Number(settings.proxyIpIntervalSec);
+  config.proxy_ip_interval_sec =
+    settings.singBoxEnabled === true && Number.isFinite(ipInterval) && ipInterval > 0
+      ? Math.min(Math.floor(ipInterval), 86400)
+      : 0;
+
+  config.random_fingerprint =
+    settings.randomFingerprint === undefined ? true : !!settings.randomFingerprint;
+  config.auto_auth_export =
+    settings.autoAuthExport === undefined ? true : !!settings.autoAuthExport;
+  // 拿到 SSO 后随机延迟再 mint（秒），后台队列，不阻塞注册
+  {
+    let dMin = Number(
+      (settings as { autoAuthDelayMinSec?: number }).autoAuthDelayMinSec ?? 60
+    );
+    let dMax = Number(
+      (settings as { autoAuthDelayMaxSec?: number }).autoAuthDelayMaxSec ?? 120
+    );
+    if (!Number.isFinite(dMin)) dMin = 60;
+    if (!Number.isFinite(dMax)) dMax = 120;
+    dMin = Math.max(0, Math.min(Math.floor(dMin), 3600));
+    dMax = Math.max(dMin, Math.min(Math.floor(dMax), 7200));
+    config.auto_auth_delay_min_sec = dMin;
+    config.auto_auth_delay_max_sec = dMax;
+  }
+  // 授权队列并发 / 背压（P0）
+  {
+    const authWorkers = Number(
+      (settings as { authExportWorkers?: number }).authExportWorkers ?? 1
+    );
+    if (Number.isFinite(authWorkers) && authWorkers >= 1) {
+      config.auth_export_workers = Math.max(1, Math.min(8, Math.floor(authWorkers)));
+    }
+    const authQMax = Number(
+      (settings as { authExportQueueMax?: number }).authExportQueueMax ?? 0
+    );
+    if (Number.isFinite(authQMax) && authQMax > 0) {
+      config.auth_export_queue_max = Math.max(1, Math.min(999, Math.floor(authQMax)));
+    }
+  }
+  // CF 邮箱鉴权模式
+  {
+    const cfMode = String(
+      (settings as { cloudflareAuthMode?: string }).cloudflareAuthMode ||
+        (settings as { mailAuthMode?: string }).mailAuthMode ||
+        ''
+    )
+      .trim()
+      .toLowerCase();
+    if (cfMode) {
+      config.cloudflare_auth_mode = cfMode;
+    }
+  }
+  // P3 可选
+  if ((settings as { enableNsfw?: boolean }).enableNsfw === true) {
+    config.enable_nsfw = true;
+  } else {
+    config.enable_nsfw = false;
+  }
+  // ZDR：已从注册流程断开（默认写入 false；模块保留后续研究）
+  config.enable_disable_zdr = false;
+  if ((settings as { sub2apiExportEnabled?: boolean }).sub2apiExportEnabled === true) {
+    config.sub2api_export_enabled = true;
+  } else {
+    config.sub2api_export_enabled = false;
+  }
+  // Auth → sub2api 远程推送（Bearer Token）
+  const allowSub2 =
+    (settings as { pushAuthToSub2api?: boolean }).pushAuthToSub2api === true ||
+    (settings as { autoPushAuthToSub2api?: boolean }).autoPushAuthToSub2api === true;
+  const autoSub2 =
+    (settings as { autoPushAuthToSub2api?: boolean }).autoPushAuthToSub2api === true ||
+    ((settings as { autoPushAuthToSub2api?: boolean }).autoPushAuthToSub2api ===
+      undefined &&
+      (settings as { pushAuthToSub2api?: boolean }).pushAuthToSub2api === true);
+  config.push_auth_to_sub2api = autoSub2;
+  config.allow_push_auth_to_sub2api = allowSub2;
+  // 写入 config 前剥掉 /api/v1（Python 侧也会再剥一次）
+  let sub2Url = allowSub2
+    ? String((settings as { sub2apiRemoteUrl?: string }).sub2apiRemoteUrl || '').trim().replace(/\/+$/, '')
+    : '';
+  if (sub2Url) {
+    for (const suffix of ['/api/v1/admin/accounts', '/api/v1/admin', '/api/v1', '/api']) {
+      if (sub2Url.toLowerCase().endsWith(suffix)) {
+        sub2Url = sub2Url.slice(0, -suffix.length).replace(/\/+$/, '');
+      }
+    }
+  }
+  let sub2Token = allowSub2
+    ? String((settings as { sub2apiAdminToken?: string }).sub2apiAdminToken || '').trim()
+    : '';
+  if (sub2Token.length >= 7 && sub2Token.slice(0, 7).toLowerCase() === 'bearer ') {
+    sub2Token = sub2Token.slice(7).trim();
+  }
+  if (sub2Url) config.sub2api_remote_url = sub2Url;
+  else delete config.sub2api_remote_url;
+  if (sub2Token) config.sub2api_admin_token = sub2Token;
+  else delete config.sub2api_admin_token;
+  {
+    const re = Number(
+      (settings as { browserRecycleEvery?: number }).browserRecycleEvery ?? 5
+    );
+    if (Number.isFinite(re) && re >= 0) {
+      config.browser_recycle_every = Math.max(0, Math.min(100, Math.floor(re)));
+    }
+    const mr = Number((settings as { maxMailRetry?: number }).maxMailRetry ?? 3);
+    if (Number.isFinite(mr) && mr >= 1) {
+      config.max_mail_retry = Math.max(1, Math.min(10, Math.floor(mr)));
+    }
+  }
+
+  // 固定 DATA_DIR/auth，不再使用自定义 authDir
+  delete config.auth_dir;
+  delete config.cpa_auth_dir;
+
+  // Auth → CPA 远程推送（pushAuthToCpa / 兼容 cpaRemotePushEnabled）
+  const cpaPushOn =
+    settings.pushAuthToCpa === true ||
+    settings.cpaRemotePushEnabled === true ||
+    settings.autoPushAuthToCpa === true;
+  const cpaRemoteUrl = cpaPushOn ? String(settings.cpaRemoteUrl || '').trim() : '';
+  const cpaManagementKey = cpaPushOn
+    ? String(settings.cpaManagementKey || '').trim()
+    : '';
+  if (cpaRemoteUrl) {
+    config.cpa_remote_url = cpaRemoteUrl;
+  } else {
+    delete config.cpa_remote_url;
+  }
+  if (cpaManagementKey) {
+    config.cpa_management_key = cpaManagementKey;
+  } else {
+    delete config.cpa_management_key;
+  }
+  // push_auth_to_cpa 由下方 autoPushAuthToCpa 统一写入
+  // 与 grokRegister-cpa-main 的 cpa_auto_add 对齐：开自动导出即视为可入库
+  config.cpa_auto_add =
+    settings.autoAuthExport === undefined ? true : !!settings.autoAuthExport;
+
+  // 注册方案 Plan A/B/C：可单独开关；顺序由 registerPlanOrder 决定
+  const planA =
+    (settings as { registerPlanAEnabled?: boolean }).registerPlanAEnabled !== false;
+  const planB = settings.registerPlanBEnabled !== false;
+  const planC =
+    (settings as { registerPlanCEnabled?: boolean }).registerPlanCEnabled === true ||
+    String((settings as { registerMode?: string }).registerMode || '')
+      .trim()
+      .toLowerCase() === 'hybrid';
+  config.register_plan_a_enabled = planA;
+  config.register_plan_b_enabled = planB;
+  config.register_plan_c_enabled = planC;
+  // 兼容旧字段：register_mode=hybrid 当 C 开
+  config.register_mode = planC ? 'hybrid' : 'browser';
+
+  // pure browser：禁协议 CreateEmail/Verify 探测（消缺模块噪声）
+  // 默认 true（与当前生产 pure 目标一致）；settings 显式 false 可关
+  {
+    const pureRaw = (settings as { registerPureBrowser?: boolean }).registerPureBrowser;
+    const pure =
+      pureRaw === undefined ? true : pureRaw === true;
+    const protocolMailRaw = (settings as { protocolMailEnabled?: boolean }).protocolMailEnabled;
+    const protocolMail =
+      protocolMailRaw === undefined ? !pure : protocolMailRaw === true;
+    config.register_pure_browser = pure;
+    config.protocol_mail_enabled = protocolMail && !pure ? true : false;
+  }
+
+  // mint 预算 / 待重试（背压不丢号）
+  {
+    const maxAtt = Number(
+      (settings as { cpaMintMaxAttempts?: number }).cpaMintMaxAttempts ?? 2
+    );
+    if (Number.isFinite(maxAtt)) {
+      config.cpa_mint_max_attempts = Math.max(0, Math.min(8, Math.floor(maxAtt)));
+    }
+    const retryMax = Number(
+      (settings as { cpaMintRetryQueueMax?: number }).cpaMintRetryQueueMax ?? 200
+    );
+    if (Number.isFinite(retryMax) && retryMax > 0) {
+      config.cpa_mint_retry_queue_max = Math.max(8, Math.min(2000, Math.floor(retryMax)));
+    }
+    const mintWorkers = Number(
+      (settings as { cpaMintWorkers?: number }).cpaMintWorkers ??
+        (settings as { cpa_mint_workers?: number }).cpa_mint_workers
+    );
+    if (Number.isFinite(mintWorkers)) {
+      config.cpa_mint_workers = Math.max(0, Math.min(8, Math.floor(mintWorkers)));
+    }
+  }
+
+  // srcback-aligned PKCE：cookie-setter 优先 + chrome131；device fallback 默认关
+  {
+    const preferCs = (settings as { cpaPreferCookieSetterPkce?: boolean })
+      .cpaPreferCookieSetterPkce;
+    config.cpa_prefer_cookie_setter_pkce =
+      preferCs === undefined ? true : preferCs === true;
+    const imp = String(
+      (settings as { cpaMintImpersonate?: string }).cpaMintImpersonate || 'chrome131'
+    ).trim();
+    config.cpa_mint_impersonate = imp || 'chrome131';
+    const allowDev = (settings as { cpaAllowDeviceFlowFallback?: boolean })
+      .cpaAllowDeviceFlowFallback;
+    // 默认 false：device 易假活（models 过 chat 403）
+    config.cpa_allow_device_flow_fallback = allowDev === true;
+    const chatDelay = Number(
+      (settings as { cpaProbeChatInitialDelaySec?: number })
+        .cpaProbeChatInitialDelaySec ?? 3
+    );
+    if (Number.isFinite(chatDelay)) {
+      config.cpa_probe_chat_initial_delay_sec = Math.max(
+        0,
+        Math.min(30, Number(chatDelay))
+      );
+    }
+    const delays = (settings as { cpaProbeChatRetryDelays?: number[] })
+      .cpaProbeChatRetryDelays;
+    if (Array.isArray(delays) && delays.length) {
+      config.cpa_probe_chat_retry_delays = delays
+        .map((x) => Number(x))
+        .filter((x) => Number.isFinite(x) && x >= 0)
+        .slice(0, 5);
+    } else {
+      config.cpa_probe_chat_retry_delays = [5, 15, 30];
+    }
+  }
+  // 执行顺序：["C","A","B"] 等；缺省 A→B→C
+  {
+    const rawOrder = (settings as { registerPlanOrder?: unknown }).registerPlanOrder;
+    const order: string[] = [];
+    const src = Array.isArray(rawOrder) ? rawOrder : [];
+    for (const x of src) {
+      const u = String(x || '')
+        .trim()
+        .toUpperCase();
+      if ((u === 'A' || u === 'B' || u === 'C') && !order.includes(u)) order.push(u);
+    }
+    for (const p of ['A', 'B', 'C']) {
+      if (!order.includes(p)) order.push(p);
+    }
+    config.register_plan_order = order;
+  }
+
+  // SSO→CPA mint：pkce | device | double（双通道两份 auth）
+  const mintMode = String(
+    (settings as { cpaMintMode?: string }).cpaMintMode || 'pkce'
+  )
+    .trim()
+    .toLowerCase();
+  if (mintMode === 'device' || mintMode === 'device_flow' || mintMode === 'b') {
+    config.cpa_mint_mode = 'device';
+  } else if (
+    mintMode === 'double' ||
+    mintMode === 'auto' ||
+    mintMode === 'c' ||
+    mintMode === 'merged' ||
+    mintMode === 'both' ||
+    mintMode === 'pkce_then_device'
+  ) {
+    config.cpa_mint_mode = 'double';
+  } else {
+    config.cpa_mint_mode = 'pkce';
+  }
+
+  // Bot/高风险是否跳过 mint（默认 true；关=仍尝试，避免策略松动丢号）
+  config.skip_bot_flag_on_mint =
+    (settings as { skipBotFlag1OnMint?: boolean }).skipBotFlag1OnMint !== false;
+  // 风控号仍 mint 时减通道重试（默认 true：double=1+1）
+  config.risk_mint_light_attempts =
+    (settings as { riskMintLightAttempts?: boolean }).riskMintLightAttempts !== false;
+
+  // 推送：允许(push*) 与 自动(autoPush*) 分离；注册成功只跟自动走
+  const allowSsoG2 = settings.pushSsoToGrok2api === true;
+  const autoSsoG2 =
+    settings.autoPushSsoToGrok2api === true ||
+    (settings.autoPushSsoToGrok2api === undefined && allowSsoG2);
+  const allowAuthCpa =
+    settings.pushAuthToCpa === true || settings.cpaRemotePushEnabled === true;
+  const autoAuthCpa =
+    settings.autoPushAuthToCpa === true ||
+    (settings.autoPushAuthToCpa === undefined && allowAuthCpa);
+  // Python 侧 push_* = 自动推送（注册成功触发）；允许仅影响 UI 手动推
+  // grok2api 仅保留 SSO 通道（已移除 Auth→grok2api）
+  config.push_sso_to_grok2api = autoSsoG2;
+  config.push_auth_to_grok2api = false;
+  config.push_auth_to_cpa = autoAuthCpa;
+  config.allow_push_sso_to_grok2api = allowSsoG2;
+  config.allow_push_auth_to_grok2api = false;
+  config.allow_push_auth_to_cpa = allowAuthCpa;
+  config.grok2api_auto_upload = autoSsoG2;
+  const g2url = String(settings.grok2apiUrl || '').trim();
+  const g2user = String(settings.grok2apiUsername || '').trim();
+  const g2pass = String(settings.grok2apiPassword || '');
+  if (g2url) config.grok2api_url = g2url;
+  else delete config.grok2api_url;
+  if (g2user) config.grok2api_username = g2user;
+  else delete config.grok2api_username;
+  if (g2pass) config.grok2api_password = g2pass;
+  else delete config.grok2api_password;
+  // 固定 web_convert；清理历史可选模式 / 引擎字段
+  config.grok2api_upload_mode = 'web_convert';
+  delete config.register_engine;
+  delete config.grok2apiUploadMode;
+
+  if (typeof count === 'number') {
+    config.run = { ...(config.run || {}), count };
+  }
+
+  // 启动前日志：代理/域名是否写入 Python config（便于对照注册日志）
+  try {
+    const nPool = Array.isArray(config.proxy_pool) ? config.proxy_pool.length : 0;
+    const nDom = Array.isArray(config.mail_domains) ? config.mail_domains.length : 0;
+    console.log(
+      `[writeConfig] singbox=${!!config.singbox_enabled} ` +
+        `proxy_enabled=${!!config.proxy_enabled} ` +
+        `proxy=${config.proxy ? 'set' : 'empty'} ` +
+        `browser_proxy=${config.browser_proxy ? 'set' : 'empty'} ` +
+        `mail_domains=${nDom} mail_provider=${config.mail_provider || 'cloudflare'} ` +
+        `planA=${config.register_plan_a_enabled !== false} ` +
+        `planB=${config.register_plan_b_enabled !== false} ` +
+        `planC=${!!config.register_plan_c_enabled} ` +
+        `planOrder=${Array.isArray(config.register_plan_order) ? (config.register_plan_order as string[]).join('>') : 'A>B>C'} ` +
+        `cpa_mint_mode=${config.cpa_mint_mode || 'pkce'} skip_bot_mint=${config.skip_bot_flag_on_mint !== false} ` +
+        `risk_light=${config.risk_mint_light_attempts !== false} ` +
+        `pure=${!!config.register_pure_browser} protocol_mail=${!!config.protocol_mail_enabled} ` +
+        `mint_budget=${config.cpa_mint_max_attempts ?? 2} ` +
+        `cpa_remote=${config.cpa_remote_url ? 'set' : 'off'}`
+    );
+  } catch {
+    /* ignore */
+  }
+
+  // 人机验证自动通过等待上限（秒）；Python 在 [30, max] 内随机
+  const autoMax = Number(settings.turnstileAutoWaitMax);
+  if (Number.isFinite(autoMax) && autoMax >= 30) {
+    config.turnstile = {
+      ...(config.turnstile || {}),
+      auto_wait_max: Math.min(180, Math.floor(autoMax))
+    };
+  }
+  // 注册轮次间隔 → Python register_interval_min
+  // 0=不等待；1～60 固定分钟；61=随机 25～50 分钟
+  {
+    const iv = Number(
+      (settings as { registerIntervalMin?: number }).registerIntervalMin ?? 1
+    );
+    if (Number.isFinite(iv)) {
+      config.register_interval_min = Math.max(0, Math.min(61, Math.floor(iv)));
+    } else {
+      config.register_interval_min = 1;
+    }
+  }
+
+  // 外置 Turnstile Solver / YesCaptcha（可选）
+  const solverOn =
+    (settings as { turnstileSolverEnabled?: boolean }).turnstileSolverEnabled === true;
+  const solverUrl = String(
+    (settings as { turnstileSolverUrl?: string }).turnstileSolverUrl ||
+      process.env.TURNSTILE_SOLVER_URL ||
+      'http://turnstile-solver:5072'
+  ).trim();
+  const ycKey = String(
+    (settings as { yescaptchaKey?: string }).yescaptchaKey ||
+      process.env.YESCAPTCHA_KEY ||
+      ''
+  ).trim();
+  const envSolverRaw = String(process.env.TURNSTILE_SOLVER_ENABLED || '')
+    .trim()
+    .toLowerCase();
+  const envSolver = envSolverRaw === '1' || envSolverRaw === 'true';
+  config.turnstile_solver_enabled = solverOn || envSolver;
+  config.turnstile_solver_url = solverUrl || 'http://turnstile-solver:5072';
+  if (ycKey) config.yescaptcha_key = ycKey;
+  else delete config.yescaptcha_key;
+
+  atomicWriteConfig(configPath, config);
+}

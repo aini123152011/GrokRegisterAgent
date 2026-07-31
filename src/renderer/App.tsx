@@ -1,0 +1,705 @@
+import { FormEvent, useEffect, useState } from 'react';
+import {
+  ArrowUpCircle,
+  Copy,
+  Database,
+  Github,
+  KeyRound,
+  LogOut,
+  Menu,
+  PlayCircle,
+  RefreshCcw,
+  Settings2,
+  ShieldCheck,
+  X
+} from 'lucide-react';
+import { RegisterPage } from '@renderer/pages/RegisterPage';
+import { PoolPage } from '@renderer/pages/PoolPage';
+import { AuthPage } from '@renderer/pages/AuthPage';
+import { SettingsPage } from '@renderer/pages/SettingsPage';
+import { ThemeToggle } from '@renderer/components/ui/ThemeToggle';
+import { ToastViewport } from '@renderer/components/ui/Toast';
+import { Button } from '@renderer/components/ui/Button';
+import { Input } from '@renderer/components/ui/Input';
+import { PasswordInput } from '@renderer/components/ui/PasswordInput';
+import { cn } from '@renderer/lib/cn';
+import { useRunStore } from '@renderer/store/runStore';
+import { useSettingsStore } from '@renderer/store/settingsStore';
+import { useAccountsStore } from '@renderer/store/accountsStore';
+import { useToastStore } from '@renderer/store/toastStore';
+import type { AuthState, ChangeCredentialsInput, UpdateInfo } from '@shared/ipc';
+
+type Tab = 'register' | 'pool' | 'auth' | 'settings';
+
+const tabs: {
+  id: Tab;
+  label: string;
+  Icon: typeof PlayCircle;
+}[] = [
+  { id: 'register', label: '注册机', Icon: PlayCircle },
+  { id: 'pool', label: 'SSO', Icon: Database },
+  { id: 'auth', label: 'Auth', Icon: KeyRound },
+  { id: 'settings', label: '配置', Icon: Settings2 }
+];
+
+const emptyAuth: AuthState = {
+  authenticated: false,
+  username: null,
+  mustChangePassword: false
+};
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>('register');
+  /** 仅手机端侧栏抽屉；lg+ 忽略 */
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [auth, setAuth] = useState<AuthState>(emptyAuth);
+  const [authLoading, setAuthLoading] = useState(true);
+  const pushToast = useToastStore((s) => s.push);
+  const applyEvent = useRunStore((s) => s.applyEvent);
+  const setStatus = useRunStore((s) => s.setStatus);
+  const setJobs = useRunStore((s) => s.setJobs);
+  const setFocusRunId = useRunStore((s) => s.setFocusRunId);
+  const applyAccount = useAccountsStore((s) => s.applyAccount);
+  const reloadSettings = useSettingsStore((s) => s.reload);
+  /** 仅本地 BUILD_ID 展示；远程对比结果必须用户点击后才写入 */
+  const [localBuildId, setLocalBuildId] = useState<string | null>(null);
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updateLoading, setUpdateLoading] = useState(false);
+
+  const loadUpdate = async () => {
+    setUpdateLoading(true);
+    try {
+      const info = await window.api.checkUpdate();
+      setUpdate(info);
+      const bid = info?.buildId || info?.current;
+      if (bid) setLocalBuildId(bid);
+      if (info?.error) {
+        pushToast({
+          tone: 'danger',
+          title: '检查更新失败',
+          description: info.error
+        });
+      } else if (info?.hasUpdate) {
+        pushToast({
+          tone: 'ok',
+          title: `发现新构建 ${info.latest ?? ''}`,
+          description:
+            info.updateHint ||
+            '请在宿主机 pull 镜像并 force-recreate；应用内不会自动重建容器'
+        });
+      } else if (info) {
+        pushToast({
+          tone: 'ok',
+          title: '已是最新',
+          description: info.updateHint || `BUILD_ID ${bid ?? info.current}`
+        });
+      }
+    } catch (err) {
+      pushToast({
+        tone: 'danger',
+        title: '检查更新失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+    } finally {
+      setUpdateLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+    void window.api
+      .getAuthState()
+      .then((state) => {
+        if (active) setAuth(state);
+      })
+      .catch(() => {
+        if (active) setAuth(emptyAuth);
+      })
+      .finally(() => {
+        if (active) setAuthLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    void reloadSettings().catch((err) => {
+      pushToast({
+        tone: 'danger',
+        title: '读取设置失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+    });
+    // 仅拉本地 BUILD_ID 展示，绝不调用 checkUpdate / 访问 GitHub（需用户点击「检查更新」）
+    void (async () => {
+      try {
+        const r = await window.api.getSystemVersion();
+        const buildId = r?.buildId || r?.current;
+        if (!buildId) return;
+        setLocalBuildId(buildId);
+        // 不写入 update：避免 Sidebar 把「仅有本地 id」误显示为「已最新」
+      } catch {
+        /* ignore */
+      }
+    })();
+  }, [auth.authenticated, pushToast, reloadSettings]);
+
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    let active = true;
+    let off: (() => void) | undefined;
+
+    // 先 hydrate 任务终态快照，再订 WebSocket；避免重放 progress 时 jobs 仍为空导致 0→100% 重播
+    void (async () => {
+      try {
+        const [nextStatus, jobsRes] = await Promise.all([
+          window.api.getStatus(),
+          window.api.listRegisterJobs()
+        ]);
+        if (!active) return;
+        setStatus(nextStatus);
+        setJobs(jobsRes.jobs, jobsRes.active);
+        if (jobsRes.focus) setFocusRunId(jobsRes.focus);
+      } catch (err) {
+        if (!active) return;
+        pushToast({
+          tone: 'danger',
+          title: '读取状态失败',
+          description: err instanceof Error ? err.message : String(err)
+        });
+      }
+      if (!active) return;
+      off = window.api.onRegisterEvent((event) => {
+        applyEvent(event);
+        if (event.type === 'account') {
+          applyAccount(event.record);
+        }
+      });
+    })();
+
+    return () => {
+      active = false;
+      off?.();
+    };
+  }, [
+    applyEvent,
+    applyAccount,
+    auth.authenticated,
+    pushToast,
+    setFocusRunId,
+    setJobs,
+    setStatus
+  ]);
+
+  const logout = async () => {
+    await window.api.logout().catch(() => undefined);
+    setAuth(emptyAuth);
+    setTab('register');
+  };
+
+  // 手机侧栏：切页关闭；切到桌面宽度时强制关
+  useEffect(() => {
+    setMobileNavOpen(false);
+  }, [tab]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(min-width: 1024px)');
+    const onChange = () => {
+      if (mq.matches) setMobileNavOpen(false);
+    };
+    onChange();
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    if (!mobileNavOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [mobileNavOpen]);
+
+  if (authLoading) {
+    return <BootScreen />;
+  }
+
+  if (!auth.authenticated) {
+    return (
+      <>
+        <LoginScreen onAuthed={setAuth} />
+        <ToastViewport />
+      </>
+    );
+  }
+
+  const activeTabLabel = tabs.find((x) => x.id === tab)?.label || '';
+
+  return (
+    <div className="app-shell">
+      {/* 手机顶栏：汉堡 + 品牌 + 当前页（lg 隐藏，不改桌面） */}
+      <header className="app-mobile-topbar lg:hidden">
+        <button
+          type="button"
+          className="app-mobile-menu-btn"
+          aria-label={mobileNavOpen ? '关闭菜单' : '打开菜单'}
+          aria-expanded={mobileNavOpen}
+          aria-controls="app-side-nav"
+          onClick={() => setMobileNavOpen((v) => !v)}
+        >
+          {mobileNavOpen ? (
+            <X className="h-5 w-5" strokeWidth={2} aria-hidden />
+          ) : (
+            <Menu className="h-5 w-5" strokeWidth={2} aria-hidden />
+          )}
+        </button>
+        <div className="nav-logo h-9 w-9 text-[11px]" aria-hidden title="Grok Register Agent">
+          GRA
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-[14px] font-semibold tracking-tight">Grok Register</p>
+          <p className="truncate text-[11px] text-muted-foreground">{activeTabLabel}</p>
+        </div>
+      </header>
+
+      {/* 手机抽屉遮罩 */}
+      <button
+        type="button"
+        className={cn('app-nav-backdrop lg:hidden', mobileNavOpen && 'app-nav-backdrop-open')}
+        aria-label="关闭菜单"
+        tabIndex={mobileNavOpen ? 0 : -1}
+        onClick={() => setMobileNavOpen(false)}
+      />
+
+      <aside
+        id="app-side-nav"
+        className={cn('app-nav', mobileNavOpen && 'app-nav-open')}
+        aria-hidden={false}
+      >
+        <div className="flex h-full flex-col">
+          <div className="nav-brand">
+            <div className="nav-logo" aria-hidden title="Grok Register Agent">
+              GRA
+            </div>
+            <div className="site-name hidden min-[380px]:flex lg:flex" aria-label="Grok Register Agent">
+              <span>Grok</span>
+              <span>Register</span>
+              <span>Agent</span>
+            </div>
+            {/* 手机抽屉内关闭 */}
+            <button
+              type="button"
+              className="app-mobile-drawer-close lg:hidden"
+              aria-label="关闭菜单"
+              onClick={() => setMobileNavOpen(false)}
+            >
+              <X className="h-4 w-4" strokeWidth={2} aria-hidden />
+            </button>
+          </div>
+
+          <nav className="app-nav-links" aria-label="主导航">
+            {tabs.map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => {
+                  setTab(id);
+                  setMobileNavOpen(false);
+                }}
+                className={cn('nav-link shrink-0', tab === id && 'nav-link-active')}
+                aria-current={tab === id ? 'page' : undefined}
+              >
+                <span className="nav-link-inner">
+                  <Icon className="h-4 w-4 shrink-0" strokeWidth={2} aria-hidden />
+                  <span className="leading-none">{label}</span>
+                </span>
+              </button>
+            ))}
+          </nav>
+
+          {/* 桌面底栏 + 手机抽屉内完整底栏（同一套 UI） */}
+          <div className="mt-auto space-y-2.5 border-t border-border/70 p-3">
+            <SidebarUpdateBar
+              localBuildId={localBuildId}
+              update={update}
+              loading={updateLoading}
+              onCheck={() => void loadUpdate()}
+            />
+            <div className="flex items-center gap-2">
+              <div className="min-w-0 flex-1">
+                <ThemeToggle />
+              </div>
+              <a
+                href="https://github.com/MurasameCyan/GrokRegisterAgent"
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                title="GitHub"
+              >
+                <Github className="h-4 w-4" strokeWidth={2} aria-hidden />
+              </a>
+            </div>
+            <div className="flex items-center justify-between gap-2 rounded-xl border border-border/60 bg-muted/50 px-2.5 py-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ok/15 text-ok">
+                  <ShieldCheck className="h-3.5 w-3.5" strokeWidth={2} aria-hidden />
+                </span>
+                <div className="min-w-0">
+                  <p className="truncate text-[13px] font-semibold leading-tight tracking-tight">
+                    {auth.username}
+                  </p>
+                  <p className="text-[10px] leading-none text-muted-foreground">已登录</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={logout}
+                className="inline-flex h-8 shrink-0 items-center justify-center gap-1 rounded-xl px-2.5 text-[11px] font-medium leading-none text-primary transition-colors hover:bg-background active:opacity-70"
+                title="退出登录"
+              >
+                <LogOut className="h-3.5 w-3.5 shrink-0" strokeWidth={2} aria-hidden />
+                <span className="leading-none">退出</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <main className="app-main">
+        <div className="page-content">
+          {tab === 'register' && <RegisterPage onOpenSettings={() => setTab('settings')} />}
+          {tab === 'pool' && <PoolPage />}
+          {tab === 'auth' && <AuthPage onOpenPool={() => setTab('pool')} />}
+          {tab === 'settings' && (
+            <SettingsPage
+              username={auth.username ?? 'admin'}
+              onAuthChanged={(next) => setAuth(next)}
+            />
+          )}
+        </div>
+      </main>
+
+      {auth.mustChangePassword && (
+        <ChangeCredentialsModal
+          username={auth.username ?? 'admin'}
+          title="首次登录需要修改账号密码"
+          description="为了避免默认 admin/admin 留在 Web 部署中，请先设置新的用户名和密码。"
+          onChanged={setAuth}
+        />
+      )}
+
+      <ToastViewport />
+    </div>
+  );
+}
+
+/**
+ * 侧边栏底部：本地 BUILD_ID + 「检查更新」。
+ * 规则：只有用户点击 onCheck 后才有远程对比结果；未检查时永远显示「检查更新」，
+ * 禁止把「仅本地 id」显示成「已最新」。
+ * 有更新时提供「复制升级命令」（宿主机执行）；不在容器内 docker pull/自重建。
+ */
+function SidebarUpdateBar({
+  localBuildId,
+  update,
+  loading,
+  onCheck
+}: {
+  localBuildId: string | null;
+  update: UpdateInfo | null;
+  loading: boolean;
+  onCheck(): void;
+}) {
+  const pushToast = useToastStore((s) => s.push);
+  // 显示 BUILD_ID（git short SHA），与注册机日志 Build: xxxxxxx 对照
+  const buildId = update?.buildId || update?.current || localBuildId;
+  const hasUpdate = !!update?.hasUpdate;
+  // 仅当用户点过检查且接口成功返回（无 error）时才算「已检测」
+  const checkedOk = !!update && !update.error;
+  const hostOverride = !!update?.hostRegisterOverride;
+
+  let actionLabel = '检查更新';
+  if (loading) actionLabel = '检查中…';
+  else if (hasUpdate && update?.latest) actionLabel = `新 ${update.latest}`;
+  else if (checkedOk && !hasUpdate) actionLabel = '已最新';
+  // 未点击 / error → 保持「检查更新」，可点（重试）
+
+  const chipTitle = [
+    checkedOk && hasUpdate
+      ? `本地 BUILD_ID=${buildId ?? '?'} · 远端 beta=${update?.latest ?? '?'}`
+      : `BUILD_ID ${buildId ?? '…'}（与注册机启动 Build 一致；更新需手动点检查）`,
+    update?.deployMode ? `部署=${update.deployMode}` : null,
+    hostOverride ? '宿主 register 覆盖中：只 pull 镜像可能仍旧版' : null,
+    update?.updateHint || null
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  // 侧栏底部控件统一：h-8 + rounded-xl + bg-muted；有更新时 ok 强调
+  const shell =
+    'inline-flex h-8 items-center justify-center gap-1 rounded-xl px-2.5 text-[11px] font-medium leading-none transition-colors';
+  const mutedBtnCls =
+    shell +
+    ' shrink-0 bg-muted text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-60';
+  const okBtnCls =
+    shell + ' shrink-0 bg-ok/15 text-ok hover:bg-ok/25';
+  const chipCls =
+    shell +
+    ' min-w-0 flex-1 truncate bg-muted font-mono tabular-nums text-muted-foreground';
+
+  const copyUpdateCommands = async () => {
+    const text =
+      update?.updateCommands?.trim() ||
+      [
+        'docker compose pull',
+        'docker compose up -d --force-recreate --remove-orphans'
+      ].join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      pushToast({
+        tone: 'ok',
+        title: '已复制升级命令',
+        description: hostOverride
+          ? '含 git pull：宿主 register 覆盖时必须更新宿主代码'
+          : '在 docker-compose 目录的宿主机终端执行'
+      });
+    } catch (err) {
+      pushToast({
+        tone: 'danger',
+        title: '复制失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+    }
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className={chipCls} title={chipTitle}>
+          {buildId ?? '…'}
+          {hostOverride ? (
+            <span className="ml-1 font-sans text-[10px] text-amber-600 dark:text-amber-400">
+              宿主
+            </span>
+          ) : null}
+        </span>
+        {checkedOk && hasUpdate ? (
+          <a
+            href={update?.htmlUrl ?? '#'}
+            target="_blank"
+            rel="noreferrer"
+            className={okBtnCls}
+            title={`远端 beta HEAD ${update?.latest ?? ''}，本地 ${buildId ?? ''}\n${update?.updateHint ?? ''}`}
+          >
+            <ArrowUpCircle className="h-3 w-3 shrink-0" aria-hidden />
+            <span className="max-w-[5.5rem] truncate">{actionLabel}</span>
+          </a>
+        ) : (
+          <button
+            type="button"
+            onClick={onCheck}
+            disabled={loading}
+            className={mutedBtnCls}
+            title={
+              update?.error ||
+              update?.updateHint ||
+              '点击后对照 GitHub beta 最新 commit hash（不会自动重建容器）'
+            }
+          >
+            <RefreshCcw
+              className={cn('h-3 w-3 shrink-0', loading && 'animate-spin')}
+              aria-hidden
+            />
+            <span className="max-w-[5.5rem] truncate">{actionLabel}</span>
+          </button>
+        )}
+      </div>
+      {checkedOk && hasUpdate && update?.updateCommands ? (
+        <button
+          type="button"
+          onClick={() => void copyUpdateCommands()}
+          className={
+            shell +
+            ' w-full bg-muted/80 text-muted-foreground hover:bg-accent hover:text-foreground'
+          }
+          title={update.updateHint || '复制宿主机升级命令'}
+        >
+          <Copy className="h-3 w-3 shrink-0" aria-hidden />
+          <span className="truncate">
+            {hostOverride ? '复制升级命令（含 git pull）' : '复制 Docker 升级命令'}
+          </span>
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function BootScreen() {
+  return (
+    <div className="login-wrap">
+      <div className="flex items-center gap-3 rounded-2xl border border-border bg-card px-6 py-5 shadow-[var(--ios-shadow)]">
+        <div className="nav-logo" aria-hidden title="Grok Register Agent">
+          GRA
+        </div>
+        <div>
+          <div className="site-name" aria-label="Grok Register Agent">
+            <span>Grok</span>
+            <span>Register</span>
+            <span>Agent</span>
+          </div>
+          <div className="mt-1 text-[13px] font-medium text-muted-foreground">正在检查登录状态…</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoginScreen({ onAuthed }: { onAuthed(next: AuthState): void }) {
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      onAuthed(await window.api.login(username, password));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="login-wrap">
+      <form onSubmit={submit} className="login-panel">
+        <div className="mb-7 flex items-center gap-3">
+          <div className="nav-logo" aria-hidden title="Grok Register Agent">
+            GRA
+          </div>
+          <div className="site-name site-name-lg" aria-label="Grok Register Agent">
+            <span>Grok</span>
+            <span>Register</span>
+            <span>Agent</span>
+          </div>
+        </div>
+        <h1 className="text-[28px] font-bold tracking-[-0.03em]">登录</h1>
+        <p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">
+          默认账号 admin / admin，首次登录后需修改。
+        </p>
+        <div className="mt-6 space-y-4">
+          <label className="block space-y-1.5">
+            <span className="field-label">用户名</span>
+            <Input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus />
+          </label>
+          <label className="block space-y-1.5">
+            <span className="field-label">密码</span>
+            <PasswordInput value={password} onChange={(e) => setPassword(e.target.value)} />
+          </label>
+          {error && (
+            <div className="rounded-xl bg-danger/10 px-3.5 py-3 text-[13px] text-danger">{error}</div>
+          )}
+          <Button type="submit" size="lg" className="w-full" disabled={busy}>
+            {busy ? '登录中…' : '继续'}
+          </Button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ChangeCredentialsModal({
+  username,
+  title,
+  description,
+  onChanged
+}: {
+  username: string;
+  title: string;
+  description: string;
+  onChanged(next: AuthState): void;
+}) {
+  const [draft, setDraft] = useState<ChangeCredentialsInput>({
+    currentPassword: '',
+    username,
+    password: '',
+    confirmPassword: ''
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      onChanged(await window.api.changeCredentials(draft));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 backdrop-blur-[2px]">
+      <form onSubmit={submit} className="w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-[var(--ios-shadow)]">
+        <div className="mb-5 flex items-start gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-ok/12 text-ok">
+            <ShieldCheck className="h-5 w-5" />
+          </div>
+          <div>
+            <h2 className="text-[20px] font-semibold tracking-[-0.02em]">{title}</h2>
+            <p className="mt-1 text-[13px] leading-5 text-muted-foreground">{description}</p>
+          </div>
+        </div>
+
+        <div className="space-y-3.5">
+          <label className="block space-y-1.5">
+            <span className="field-label">当前密码</span>
+            <PasswordInput
+              value={draft.currentPassword}
+              onChange={(e) => setDraft({ ...draft, currentPassword: e.target.value })}
+              autoFocus
+            />
+          </label>
+          <label className="block space-y-1.5">
+            <span className="field-label">新用户名</span>
+            <Input
+              value={draft.username}
+              onChange={(e) => setDraft({ ...draft, username: e.target.value })}
+            />
+          </label>
+          <label className="block space-y-1.5">
+            <span className="field-label">新密码</span>
+            <PasswordInput
+              value={draft.password}
+              onChange={(e) => setDraft({ ...draft, password: e.target.value })}
+            />
+          </label>
+          <label className="block space-y-1.5">
+            <span className="field-label">确认密码</span>
+            <PasswordInput
+              value={draft.confirmPassword}
+              onChange={(e) => setDraft({ ...draft, confirmPassword: e.target.value })}
+            />
+          </label>
+          {error && (
+            <div className="rounded-xl bg-danger/10 px-3.5 py-3 text-[13px] text-danger">{error}</div>
+          )}
+          <Button type="submit" size="lg" className="w-full" disabled={busy}>
+            {busy ? '保存中…' : '保存并继续'}
+          </Button>
+        </div>
+      </form>
+    </div>
+  );
+}

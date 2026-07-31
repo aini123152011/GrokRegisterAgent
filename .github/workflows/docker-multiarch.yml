@@ -1,0 +1,84 @@
+name: Docker multi-arch
+
+# Avoid docker/metadata-action (can fail with GitHub Unicorn HTML / API 5xx).
+# Tags are set explicitly; image name is fixed lowercase for GHCR.
+
+on:
+  push:
+    branches: [beta]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # must match root docker-compose.yml (all lowercase)
+  IMAGE: ghcr.io/murasamecyan/grokregisteragent
+  # 与 scripts/fetch-sing-box.sh 默认一致；升级时改此处即可
+  SING_BOX_VERSION: "1.13.14"
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker tags
+        id: tags
+        run: |
+          set -euo pipefail
+          SHA_SHORT="$(echo '${{ github.sha }}' | cut -c1-7)"
+          TAGS="${{ env.IMAGE }}:sha-${SHA_SHORT}"
+          if [ "${{ github.ref }}" = "refs/heads/beta" ]; then
+            TAGS="${TAGS},${{ env.IMAGE }}:beta,${{ env.IMAGE }}:latest"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${{ github.ref_name }}"
+            TAGS="${TAGS},${{ env.IMAGE }}:${VER}"
+            MINOR="$(echo "$VER" | sed -E 's/^v([0-9]+\.[0-9]+).*/\1/')"
+            if [ -n "$MINOR" ] && [ "$MINOR" != "$VER" ]; then
+              TAGS="${TAGS},${{ env.IMAGE }}:${MINOR}"
+            fi
+          else
+            BRANCH="$(echo '${{ github.ref_name }}' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
+            TAGS="${TAGS},${{ env.IMAGE }}:${BRANCH}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}"
+
+      - name: Download sing-box (linux-amd64 + linux-arm64)
+        run: |
+          chmod +x scripts/fetch-sing-box.sh
+          ./scripts/fetch-sing-box.sh
+          test -x register/bin/sing-box/linux-amd64
+          test -x register/bin/sing-box/linux-arm64
+          ls -lh register/bin/sing-box/
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            REGISTER_BUILD=${{ github.sha }}
+            SING_BOX_VERSION=${{ env.SING_BOX_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
