@@ -47,8 +47,10 @@ jobs:
             GHCR_TAGS="${GHCR_TAGS},${{ env.GHCR_IMAGE }}:${BRANCH}"
             DH_TAGS="${DH_TAGS},${{ env.DH_IMAGE }}:${BRANCH}"
           fi
+          ALL_TAGS="${GHCR_TAGS},${DH_TAGS}"
           echo "ghcr_tags=${GHCR_TAGS}" >> "$GITHUB_OUTPUT"
           echo "dh_tags=${DH_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "all_tags=${ALL_TAGS}" >> "$GITHUB_OUTPUT"
           echo "ghcr_tags=${GHCR_TAGS}"
           echo "dh_tags=${DH_TAGS}"
 
@@ -63,32 +65,21 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ github.token }}
+          password:[REDACTED] github.token }}
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password:[REDACTED] secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push to GHCR
+      - name: Build and push once to GHCR and Docker Hub
         uses: docker/build-push-action@v6
         with:
           context: ./docker/turnstile-solver
           file: ./docker/turnstile-solver/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.tags.outputs.ghcr_tags }}
-          cache-from: type=gha,scope=turnstile-solver
-          cache-to: type=gha,mode=max,scope=turnstile-solver
-
-      - name: Build and push to Docker Hub
-        uses: docker/build-push-action@v6
-        with:
-          context: ./docker/turnstile-solver
-          file: ./docker/turnstile-solver/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.dh_tags }}
+          tags: ${{ steps.tags.outputs.all_tags }}
           cache-from: type=gha,scope=turnstile-solver
           cache-to: type=gha,mode=max,scope=turnstile-solver

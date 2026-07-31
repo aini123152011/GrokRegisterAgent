@@ -49,8 +49,10 @@ jobs:
             GHCR_TAGS="${GHCR_TAGS},${{ env.GHCR_IMAGE }}:${BRANCH}"
             DH_TAGS="${DH_TAGS},${{ env.DH_IMAGE }}:${BRANCH}"
           fi
+          ALL_TAGS="${GHCR_TAGS},${DH_TAGS}"
           echo "ghcr_tags=${GHCR_TAGS}" >> "$GITHUB_OUTPUT"
           echo "dh_tags=${DH_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "all_tags=${ALL_TAGS}" >> "$GITHUB_OUTPUT"
           echo "ghcr_tags=${GHCR_TAGS}"
           echo "dh_tags=${DH_TAGS}"
 
@@ -81,28 +83,14 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push to GHCR
+      - name: Build and push once to GHCR and Docker Hub
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.tags.outputs.ghcr_tags }}
-          build-args: |
-            REGISTER_BUILD=${{ github.sha }}
-            SING_BOX_VERSION=${{ env.SING_BOX_VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build and push to Docker Hub
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.dh_tags }}
+          tags: ${{ steps.tags.outputs.all_tags }}
           build-args: |
             REGISTER_BUILD=${{ github.sha }}
             SING_BOX_VERSION=${{ env.SING_BOX_VERSION }}
