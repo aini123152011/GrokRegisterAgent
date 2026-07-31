@@ -1,7 +1,7 @@
 name: Docker Turnstile Solver multi-arch
 
 # Avoid docker/metadata-action (can fail with GitHub Unicorn HTML / API 5xx).
-# Tags are set explicitly; image name is fixed lowercase for GHCR.
+# Tags are set explicitly for GHCR and Docker Hub.
 
 on:
   push:
@@ -13,9 +13,8 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: ghcr.io
-  # must match root docker-compose.yml (all lowercase)
-  IMAGE: ghcr.io/aini123152011/grok-turnstile-solver
+  GHCR_IMAGE: ghcr.io/aini123152011/grok-turnstile-solver
+  DH_IMAGE: aini123152008/grok-turnstile-solver
 
 jobs:
   build-push:
@@ -32,23 +31,29 @@ jobs:
         run: |
           set -euo pipefail
           SHA_SHORT="$(echo '${{ github.sha }}' | cut -c1-7)"
-          TAGS="${{ env.IMAGE }}:sha-${SHA_SHORT}"
+          GHCR_TAGS="${{ env.GHCR_IMAGE }}:sha-${SHA_SHORT}"
+          DH_TAGS="${{ env.DH_IMAGE }}:sha-${SHA_SHORT}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            TAGS="${TAGS},${{ env.IMAGE }}:main,${{ env.IMAGE }}:latest"
+            GHCR_TAGS="${GHCR_TAGS},${{ env.GHCR_IMAGE }}:main,${{ env.GHCR_IMAGE }}:latest"
+            DH_TAGS="${DH_TAGS},${{ env.DH_IMAGE }}:main,${{ env.DH_IMAGE }}:latest"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VER="${{ github.ref_name }}"
-            TAGS="${TAGS},${{ env.IMAGE }}:${VER}"
-            # v1.2.3 -> also 1.2
+            GHCR_TAGS="${GHCR_TAGS},${{ env.GHCR_IMAGE }}:${VER}"
+            DH_TAGS="${DH_TAGS},${{ env.DH_IMAGE }}:${VER}"
             MINOR="$(echo "$VER" | sed -E 's/^v([0-9]+\.[0-9]+).*/\1/')"
             if [ -n "$MINOR" ] && [ "$MINOR" != "$VER" ]; then
-              TAGS="${TAGS},${{ env.IMAGE }}:${MINOR}"
+              GHCR_TAGS="${GHCR_TAGS},${{ env.GHCR_IMAGE }}:${MINOR}"
+              DH_TAGS="${DH_TAGS},${{ env.DH_IMAGE }}:${MINOR}"
             fi
           else
             BRANCH="$(echo '${{ github.ref_name }}' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
-            TAGS="${TAGS},${{ env.IMAGE }}:${BRANCH}"
+            GHCR_TAGS="${GHCR_TAGS},${{ env.GHCR_IMAGE }}:${BRANCH}"
+            DH_TAGS="${DH_TAGS},${{ env.DH_IMAGE }}:${BRANCH}"
           fi
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echo "tags=${TAGS}"
+          echo "ghcr_tags=${GHCR_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "dh_tags=${DH_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "ghcr_tags=${GHCR_TAGS}"
+          echo "dh_tags=${DH_TAGS}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -59,17 +64,34 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password:[REDACTED] secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (linux/amd64 + linux/arm64)
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password:[REDACTED] secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push to GHCR
         uses: docker/build-push-action@v6
         with:
           context: ./docker/turnstile-solver
           file: ./docker/turnstile-solver/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.tags.outputs.ghcr_tags }}
+          cache-from: type=gha,scope=turnstile-solver
+          cache-to: type=gha,mode=max,scope=turnstile-solver
+
+      - name: Build and push to Docker Hub
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker/turnstile-solver
+          file: ./docker/turnstile-solver/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.dh_tags }}
           cache-from: type=gha,scope=turnstile-solver
           cache-to: type=gha,mode=max,scope=turnstile-solver
