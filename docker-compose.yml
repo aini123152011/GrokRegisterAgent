@@ -11,7 +11,7 @@
 
 services:
   grok-register-agent:
-    image: ghcr.io/aini123152011/grokregisteragent:latest
+    image: ghcr.io/aini123152011/grok-register-agent:latest
     container_name: grok-register-agent
     restart: unless-stopped
     ports:

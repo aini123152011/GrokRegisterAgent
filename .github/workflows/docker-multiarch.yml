@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
 
 env:
-  GHCR_IMAGE: ghcr.io/aini123152011/grokregisteragent
-  DH_IMAGE: aini123152008/grokregisteragent
+  GHCR_IMAGE: ghcr.io/aini123152011/grok-register-agent
+  DH_IMAGE: aini123152008/grok-register-agent
   # 与 scripts/fetch-sing-box.sh 默认一致；升级时改此处即可
   SING_BOX_VERSION: "1.13.14"
 
