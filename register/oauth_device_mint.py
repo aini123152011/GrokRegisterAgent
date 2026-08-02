@@ -13,8 +13,8 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-ISSUER = "https://auth.x.ai"
+from cpa_schema import CLIENT_ID, ISSUER
+
 DEVICE_CODE_URL = f"{ISSUER}/oauth2/device/code"
 TOKEN_URL = f"{ISSUER}/oauth2/token"
 

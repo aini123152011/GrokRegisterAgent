@@ -600,7 +600,10 @@ def sso_to_token_via_browser_consent(
         }
     )
     auth_url = f"{OIDC_ISSUER}/oauth2/authorize?{authorize_params}"
-    hard_timeout = max(30.0, min(float(timeout or 55.0), 90.0))
+    # The OAuth budget starts only after profile startup + cookie warm-up.  The
+    # previous watchdog started here and often killed Chromium before the first
+    # authorize navigation had even begun.
+    hard_timeout = max(60.0, min(float(timeout or 120.0), 180.0))
 
     # Parse redirect host/port for local code catcher
     try:
@@ -890,8 +893,11 @@ def sso_to_token_via_browser_consent(
 
     browser = None
     done = {"v": False}
+    watchdog_started = threading.Event()
 
     def _watchdog() -> None:
+        if not watchdog_started.wait(timeout=300.0):
+            return
         time.sleep(hard_timeout + 10.0)
         if done["v"]:
             return
@@ -904,7 +910,10 @@ def sso_to_token_via_browser_consent(
                 pass
         _stop_cb_server()
 
-    threading.Thread(target=_watchdog, name="browser-consent-wd", daemon=True).start()
+    watchdog_thread = threading.Thread(
+        target=_watchdog, name="browser-consent-wd", daemon=True
+    )
+    watchdog_thread.start()
     _start_cb_server()
 
     def _inject_sso(page, *, reason: str = "") -> int:
@@ -1234,6 +1243,7 @@ return (t.innerText || t.value || 'Allow').trim().slice(0, 32);
         _warm_and_bind_sso(page)
 
         log("  🔑 browser consent: open authorize…")
+        watchdog_started.set()
         _open_authorize(page)
 
         code = None

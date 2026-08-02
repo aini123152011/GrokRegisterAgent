@@ -699,7 +699,7 @@ def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]
                     else:
                         code = m.group(1).upper()
                     code = code.replace("-", "")
-                    print(f"[*] 手动 OTP 已读到: {code[:3]}-{code[3:]}", flush=True)
+                    print(f"[*] 手动 OTP 已读到: <redacted:{len(code)}>", flush=True)
                     # consume file so next run won't reuse
                     for fp in paths:
                         try:
@@ -1347,7 +1347,7 @@ def wait_for_verification_code(jwt: str, timeout: int = 120, email: str = "") ->
                 code = extract_verification_code(direct_code) or direct_code
                 code = code.strip()
                 if code:
-                    print(f"[*] 提取到验证码: {code}")
+                    print(f"[*] 提取到验证码: <redacted:{len(code)}>")
                     return code
 
             full = _message_body_text(msg)
@@ -1383,7 +1383,7 @@ def wait_for_verification_code(jwt: str, timeout: int = 120, email: str = "") ->
 
             code = extract_verification_code(content)
             if code:
-                print(f"[*] 提取到验证码: {code}")
+                print(f"[*] 提取到验证码: <redacted:{len(code)}>")
                 return code
         time.sleep(poll_interval)
 

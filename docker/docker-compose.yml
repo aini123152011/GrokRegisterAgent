@@ -1,22 +1,18 @@
-# 本地源码构建镜像（开发/调试用）。
-# 生产环境请使用仓库根目录 docker-compose.yml 拉取 GHCR 镜像。
-#
-#   cd docker
-#   cp .env.example .env
-#   docker compose up -d --build
-#
-# 热更新：修改仓库根目录 register/ 后 docker compose restart 即可同步。
-
+# Local source build. The solver is opt-in via `--profile solver`.
 services:
   grok-agent:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: grok-agent:beta
+    image: grok-agent:local
     container_name: grok-agent
     restart: unless-stopped
     ports:
       - "${WEB_PORT:-6657}:6657"
+      - "127.0.0.1:${TURNSTILE_SOLVER_HOST_PORT:-5072}:5072"
+    extra_hosts:
+      # Keep existing UI/config values compatible after the solver shares this network namespace.
+      - "turnstile-solver:127.0.0.1"
     environment:
       PORT: "6657"
       BIND_HOST: "0.0.0.0"
@@ -27,6 +23,12 @@ services:
       REGISTER_HOST_SRC: "/opt/register-host"
       REGISTER_SEED: "/opt/register-seed"
       SSO_DIR: "/data/sso"
+      AUTH_QUEUE_DAEMON: "${AUTH_QUEUE_DAEMON:-1}"
+      AUTH_QUEUE_DIR: "/data/auth-queue"
+      AUTH_QUEUE_WORKERS: "${AUTH_QUEUE_WORKERS:-1}"
+      AUTH_QUEUE_MAX_ATTEMPTS: "${AUTH_QUEUE_MAX_ATTEMPTS:-4}"
+      OAUTH_PREFLIGHT_CACHE_SEC: "${OAUTH_PREFLIGHT_CACHE_SEC:-45}"
+      XAI_OIDC_ISSUER: "${XAI_OIDC_ISSUER:-https://auth.x.ai}"
       MAIL_PROVIDER: "${MAIL_PROVIDER:-}"
       MAIL_API_BASE: "${MAIL_API_BASE:-}"
       MAIL_ADMIN_AUTH: "${MAIL_ADMIN_AUTH:-}"
@@ -40,7 +42,44 @@ services:
       BROWSER_PATH: "/usr/bin/chromium"
       COOKIE_SECURE: "${COOKIE_SECURE:-}"
       DISPLAY: ":99"
+      TURNSTILE_SOLVER_ENABLED: "${TURNSTILE_SOLVER_ENABLED:-0}"
+      TURNSTILE_SOLVER_URL: "${TURNSTILE_SOLVER_URL:-http://turnstile-solver:5072}"
+      TURNSTILE_API_KEY: "${TURNSTILE_API_KEY:-}"
+      YESCAPTCHA_KEY: "${YESCAPTCHA_KEY:-}"
     volumes:
       - ./data:/data
       - ../register:/opt/register-host:ro
+    shm_size: "1gb"
+
+  turnstile-solver:
+    profiles: ["solver"]
+    build:
+      context: ./turnstile-solver
+      dockerfile: Dockerfile
+    image: grok-turnstile-solver:local
+    container_name: grok-turnstile-solver
+    restart: unless-stopped
+    # The registration proxy is a loopback-only sing-box listener in grok-agent.
+    # Sharing its network namespace keeps registration and solver on one exit IP.
+    network_mode: "service:grok-agent"
+    depends_on:
+      - grok-agent
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "5072"
+      THREAD: "${TURNSTILE_SOLVER_THREADS:-2}"
+      BROWSER_TYPE: "${TURNSTILE_SOLVER_BROWSER:-chromium}"
+      DEBUG: "${TURNSTILE_SOLVER_DEBUG:-0}"
+      PROXY: "${TURNSTILE_SOLVER_PROXY:-1}"
+      TURNSTILE_API_KEY: "${TURNSTILE_API_KEY:-}"
+      TURNSTILE_ADMIN_KEY: "${TURNSTILE_ADMIN_KEY:-}"
+      TURNSTILE_ALLOWED_HOSTS: "${TURNSTILE_ALLOWED_HOSTS:-accounts.x.ai}"
+      TURNSTILE_ALLOW_PRIVATE_TARGETS: "${TURNSTILE_ALLOW_PRIVATE_TARGETS:-0}"
+      TURNSTILE_QUEUE_SIZE: "${TURNSTILE_QUEUE_SIZE:-16}"
+      TURNSTILE_TASK_TIMEOUT: "${TURNSTILE_TASK_TIMEOUT:-90}"
+      TURNSTILE_BROWSER_AUTO_FETCH: "${TURNSTILE_BROWSER_AUTO_FETCH:-1}"
+      XDG_CACHE_HOME: "/data/cache"
+      PLAYWRIGHT_BROWSERS_PATH: "/opt/patchright-browsers"
+    volumes:
+      - ./solver-data:/data
     shm_size: "1gb"

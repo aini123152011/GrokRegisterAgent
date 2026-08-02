@@ -2662,10 +2662,18 @@ return frames.some(f=>{
                     sk = self._extract_turnstile_sitekey() or ""
                 except Exception:
                     sk = ""
+                current_proxy = ""
+                try:
+                    from grok_register_ttk import _engine
+
+                    current_proxy = str(getattr(_engine(), "_browser_proxy", "") or "").strip()
+                except Exception:
+                    current_proxy = str(os.getenv("BROWSER_PROXY", "") or "").strip()
                 ext = solve_turnstile(
                     siteurl="https://accounts.x.ai/sign-up",
                     sitekey=sk,
                     max_wait=min(90, max(30, int(timeout or 50))),
+                    proxy=current_proxy,
                     log=self._lg,
                 )
                 if ext and len(str(ext)) >= 80:

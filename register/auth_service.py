@@ -380,7 +380,7 @@ def _via_pkce_token(
     try:
         from sso_to_auth import sso_to_token_via_browser_consent
 
-        log("[auth] PKCE path → browser consent fallback (timeout=55s, headed/Xvfb)…")
+        log("[auth] PKCE path → browser consent fallback (flow timeout=120s, headed/Xvfb)…")
         with _BROWSER_CONSENT_LOCK:
             # Linux 容器：必须有头（复用注册机 Xvfb）。Chrome headless 会被 auth.x.ai CF 硬拦。
             px = str(proxy or "").strip()
@@ -400,7 +400,7 @@ def _via_pkce_token(
                 proxy=px,
                 log=log,
                 headless=False,
-                timeout=55.0,
+                timeout=120.0,
                 cloudflare_cookies=cloudflare_cookies or "",
             )
         if tokens and tokens.get("access_token"):

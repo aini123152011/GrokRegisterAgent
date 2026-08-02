@@ -148,4 +148,15 @@ if command -v Xvfb >/dev/null 2>&1; then
   echo "[entrypoint] Xvfb ready DISPLAY=${DISPLAY}"
 fi
 
+if [[ "${AUTH_QUEUE_DAEMON:-1}" == "1" && -f "${REGISTER_DIR}/auth_queue_daemon.py" ]]; then
+  export AUTH_QUEUE_DAEMON=1
+  export AUTH_QUEUE_DIR="${AUTH_QUEUE_DIR:-/data/auth-queue}"
+  mkdir -p "${AUTH_QUEUE_DIR}"
+  python3 -u "${REGISTER_DIR}/auth_queue_daemon.py" &
+  auth_daemon_pid=$!
+  echo "[entrypoint] auth queue daemon started pid=${auth_daemon_pid} dir=${AUTH_QUEUE_DIR}"
+else
+  echo "[entrypoint] auth queue daemon disabled"
+fi
+
 exec node /app/server/dist/server/src/index.js

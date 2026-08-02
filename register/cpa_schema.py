@@ -10,16 +10,40 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import random
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 # Must match CLIProxyAPI internal/auth/xai/types.go
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-ISSUER = "https://auth.x.ai"
-DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
+
+
+def resolve_oidc_issuer() -> str:
+    env = str(os.environ.get("XAI_OIDC_ISSUER") or "").strip().rstrip("/")
+    if env:
+        return env
+    try:
+        path = Path(__file__).resolve().parent / "config.json"
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        value = str(
+            data.get("xai_oidc_issuer")
+            or data.get("xaiOidcIssuer")
+            or data.get("oauth_issuer")
+            or ""
+        ).strip().rstrip("/")
+        if value:
+            return value
+    except Exception:
+        pass
+    return "https://auth.x.ai"
+
+
+ISSUER = resolve_oidc_issuer()
+DEFAULT_TOKEN_ENDPOINT = f"{ISSUER}/oauth2/token"
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 # Free Build promo path (NOT api.x.ai)
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"

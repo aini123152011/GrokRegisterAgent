@@ -1,237 +1,373 @@
 # -*- coding: utf-8 -*-
-"""外置 Turnstile Solver / YesCaptcha 客户端（可选）。
+"""Turnstile solver client with local and YesCaptcha providers.
 
-配置来自 register/config.json 或环境变量：
-  turnstile_solver_enabled / TURNSTILE_SOLVER_ENABLED
-  turnstile_solver_url     / TURNSTILE_SOLVER_URL   (默认 http://turnstile-solver:5072)
-  yescaptcha_key           / YESCAPTCHA_KEY
-
-协议对齐 grok1 TurnstileService：
-  本地: GET {url}/turnstile?url=&sitekey= → taskId
-        GET {url}/result?id= → solution.token
-  YesCaptcha: createTask / getTaskResult
+The public ``solve_turnstile`` function remains backward compatible and returns
+only a token. New code can use ``solve_turnstile_result`` for typed status and
+error details.
 """
 from __future__ import annotations
 
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
-from urllib.parse import quote
+from typing import Any, Callable, Literal, Optional
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-LogFn = Callable[[str], None]
 
+LogFn = Callable[[str], None]
+Provider = Literal["local", "yescaptcha", "none"]
 _DEFAULT_SITE_URL = "https://accounts.x.ai"
 _DEFAULT_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 _YESCAPTCHA_API = "https://api.yescaptcha.com"
+_TERMINAL_STATUSES = {"failed", "error", "expired", "cancelled"}
 
 
-def _lg(log: Optional[LogFn], msg: str) -> None:
+@dataclass(frozen=True, slots=True)
+class SolveResult:
+    status: Literal["ready", "failed"]
+    provider: Provider
+    token: str = ""
+    task_id: str = ""
+    error_code: str = ""
+    error: str = ""
+    elapsed_ms: int = 0
+
+    @property
+    def solved(self) -> bool:
+        return self.status == "ready" and bool(self.token)
+
+
+class SolverApiError(RuntimeError):
+    def __init__(self, status: int, data: dict[str, Any], message: str = "") -> None:
+        self.status = status
+        self.data = data
+        detail = str(data.get("errorDescription") or data.get("message") or message or f"HTTP {status}")
+        super().__init__(detail)
+
+
+def _log(log: Optional[LogFn], message: str) -> None:
     if log:
         try:
-            log(msg)
+            log(message)
             return
         except Exception:
             pass
-    print(msg, flush=True)
+    print(message, flush=True)
 
 
 def _load_cfg() -> dict[str, Any]:
-    p = Path(__file__).resolve().parent / "config.json"
+    path = Path(__file__).resolve().parent / "config.json"
     try:
-        if p.is_file():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception:
-        pass
-    return {}
+        return {}
 
 
 def solver_enabled(cfg: Optional[dict[str, Any]] = None) -> bool:
-    c = cfg if cfg is not None else _load_cfg()
-    env = os.getenv("TURNSTILE_SOLVER_ENABLED", "").strip().lower()
-    if env in ("1", "true", "yes", "on"):
+    config = cfg if cfg is not None else _load_cfg()
+    raw = os.getenv("TURNSTILE_SOLVER_ENABLED", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
         return True
-    if env in ("0", "false", "no", "off"):
+    if raw in {"0", "false", "no", "off"}:
         return False
-    if c.get("turnstile_solver_enabled") is True:
-        return True
-    # URL 显式配置且非空也视为可用意图（enabled 默认 false，需开关）
-    return bool(c.get("turnstile_solver_enabled"))
+    return bool(config.get("turnstile_solver_enabled"))
 
 
 def solver_url(cfg: Optional[dict[str, Any]] = None) -> str:
-    c = cfg if cfg is not None else _load_cfg()
-    u = (
+    config = cfg if cfg is not None else _load_cfg()
+    return (
         os.getenv("TURNSTILE_SOLVER_URL", "").strip()
-        or str(c.get("turnstile_solver_url") or "").strip()
+        or str(config.get("turnstile_solver_url") or "").strip()
         or "http://turnstile-solver:5072"
-    )
-    return u.rstrip("/")
+    ).rstrip("/")
+
+
+def solver_key(cfg: Optional[dict[str, Any]] = None) -> str:
+    config = cfg if cfg is not None else _load_cfg()
+    return os.getenv("TURNSTILE_API_KEY", "").strip() or str(config.get("turnstile_solver_key") or "").strip()
 
 
 def yescaptcha_key(cfg: Optional[dict[str, Any]] = None) -> str:
-    c = cfg if cfg is not None else _load_cfg()
-    return (
-        os.getenv("YESCAPTCHA_KEY", "").strip()
-        or str(c.get("yescaptcha_key") or "").strip()
-    )
+    config = cfg if cfg is not None else _load_cfg()
+    return os.getenv("YESCAPTCHA_KEY", "").strip() or str(config.get("yescaptcha_key") or "").strip()
 
 
 def sitekey_default(cfg: Optional[dict[str, Any]] = None) -> str:
-    c = cfg if cfg is not None else _load_cfg()
-    return str(c.get("turnstile_sitekey") or _DEFAULT_SITEKEY).strip() or _DEFAULT_SITEKEY
+    config = cfg if cfg is not None else _load_cfg()
+    return str(config.get("turnstile_sitekey") or _DEFAULT_SITEKEY).strip() or _DEFAULT_SITEKEY
 
 
 def _http_json(
     method: str,
     url: str,
     *,
-    body: Optional[dict] = None,
+    body: Optional[dict[str, Any]] = None,
     timeout: float = 20.0,
+    api_key: str = "",
 ) -> dict[str, Any]:
-    data = None
-    headers = {"Accept": "application/json", "User-Agent": "GrokRegisterAgent/turnstile-solver-client"}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "GrokRegisterAgent/turnstile-client-v2",
+    }
+    if payload is not None:
         headers["Content-Type"] = "application/json"
-    req = Request(url, data=data, headers=headers, method=method.upper())
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        if not raw.strip():
-            return {}
-        out = json.loads(raw)
-        return out if isinstance(out, dict) else {}
-
-
-def probe_solver(
-    url: str = "",
-    *,
-    timeout: float = 5.0,
-    log: Optional[LogFn] = None,
-) -> dict[str, Any]:
-    """探活本地 solver。返回 {ok, message, latency_ms, url}。"""
-    base = (url or solver_url()).rstrip("/")
-    if not base:
-        return {"ok": False, "message": "未配置 solver URL", "url": "", "latency_ms": 0}
-    t0 = time.time()
+    if api_key:
+        headers["X-API-Key"] = api_key
+    request = Request(url, data=payload, headers=headers, method=method.upper())
     try:
-        req = Request(
-            base + "/",
-            headers={"User-Agent": "GrokRegisterAgent/probe"},
-            method="GET",
-        )
-        with urlopen(req, timeout=timeout) as resp:
-            status = int(getattr(resp, "status", 200) or 200)
-            _ = resp.read(2048)
-        ms = int((time.time() - t0) * 1000)
-        if 200 <= status < 500:
-            return {
-                "ok": True,
-                "message": f"solver 可达 HTTP {status}",
-                "url": base,
-                "latency_ms": ms,
-            }
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status = int(getattr(response, "status", 200) or 200)
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            data = {}
+        raise SolverApiError(exc.code, data if isinstance(data, dict) else {}, raw[:300]) from exc
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise SolverApiError(status, {}, "solver returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise SolverApiError(status, {}, "solver returned a non-object response")
+    return data
+
+
+def probe_solver(url: str = "", *, timeout: float = 5.0, log: Optional[LogFn] = None) -> dict[str, Any]:
+    base = (url or solver_url()).rstrip("/")
+    started = time.monotonic()
+    try:
+        data = _http_json("GET", f"{base}/health", timeout=timeout)
+        latency = int((time.monotonic() - started) * 1_000)
+        ok = bool(data.get("ok"))
         return {
-            "ok": False,
-            "message": f"HTTP {status}",
+            "ok": ok,
+            "message": f"solver {data.get('status', 'reachable')}" if ok else "solver health check failed",
             "url": base,
-            "latency_ms": ms,
+            "latency_ms": latency,
+            "backend": data.get("backend", ""),
+            "queue_depth": data.get("queueDepth", 0),
         }
-    except Exception as e:
-        ms = int((time.time() - t0) * 1000)
+    except Exception as exc:
         return {
             "ok": False,
-            "message": str(e) or "connect failed",
+            "message": str(exc) or "connection failed",
             "url": base,
-            "latency_ms": ms,
+            "latency_ms": int((time.monotonic() - started) * 1_000),
         }
 
 
-def _solve_local(
+def _task_payload(
+    siteurl: str,
+    sitekey: str,
+    *,
+    proxy: str,
+    action: str,
+    cdata: str,
+) -> dict[str, Any]:
+    task: dict[str, Any] = {
+        "type": "TurnstileTask" if proxy else "TurnstileTaskProxyless",
+        "websiteURL": siteurl,
+        "websiteKey": sitekey,
+    }
+    if proxy:
+        task["proxy"] = proxy
+    if action:
+        task["action"] = action
+    if cdata:
+        task["cData"] = cdata
+    return task
+
+
+def _poll_provider(
+    base_url: str,
+    task_id: str,
+    *,
+    client_key: str,
+    provider: Literal["local", "yescaptcha"],
+    max_wait: float,
+    log: Optional[LogFn],
+) -> SolveResult:
+    started = time.monotonic()
+    deadline = started + max(10.0, float(max_wait))
+    delay = 1.0 if provider == "local" else 2.0
+    while time.monotonic() < deadline:
+        try:
+            data = _http_json(
+                "POST",
+                f"{base_url}/getTaskResult",
+                body={"clientKey": client_key, "taskId": task_id},
+                timeout=min(20.0, max(3.0, deadline - time.monotonic())),
+                api_key=client_key if provider == "local" else "",
+            )
+        except SolverApiError as exc:
+            if exc.status >= 500:
+                _log(log, f"[{provider}] transient polling HTTP {exc.status}: {exc}")
+                time.sleep(delay)
+                continue
+            return SolveResult(
+                "failed",
+                provider,
+                task_id=task_id,
+                error_code=str(exc.data.get("errorCode") or f"HTTP_{exc.status}"),
+                error=str(exc),
+                elapsed_ms=int((time.monotonic() - started) * 1_000),
+            )
+        except (TimeoutError, OSError) as exc:
+            _log(log, f"[{provider}] transient polling error: {exc}")
+            time.sleep(delay)
+            continue
+
+        status = str(data.get("status") or "").strip().lower()
+        error_id = int(data.get("errorId") or 0)
+        if error_id or status in _TERMINAL_STATUSES:
+            return SolveResult(
+                "failed",
+                provider,
+                task_id=task_id,
+                error_code=str(data.get("errorCode") or "ERROR_TASK_FAILED"),
+                error=str(data.get("errorDescription") or status or "solver task failed"),
+                elapsed_ms=int((time.monotonic() - started) * 1_000),
+            )
+        if status == "ready" or data.get("solution"):
+            solution = data.get("solution") if isinstance(data.get("solution"), dict) else {}
+            token = str(solution.get("token") or solution.get("gRecaptchaResponse") or data.get("token") or "").strip()
+            if token:
+                return SolveResult(
+                    "ready",
+                    provider,
+                    token=token,
+                    task_id=task_id,
+                    elapsed_ms=int((time.monotonic() - started) * 1_000),
+                )
+            return SolveResult("failed", provider, task_id=task_id, error_code="ERROR_EMPTY_TOKEN", error="ready response had no token")
+        time.sleep(delay)
+    return SolveResult(
+        "failed",
+        provider,
+        task_id=task_id,
+        error_code="ERROR_CLIENT_TIMEOUT",
+        error=f"no terminal result within {max_wait:.0f}s",
+        elapsed_ms=int((time.monotonic() - started) * 1_000),
+    )
+
+
+def _solve_provider(
+    provider: Literal["local", "yescaptcha"],
     siteurl: str,
     sitekey: str,
     *,
     base_url: str,
-    max_wait: float = 90.0,
-    log: Optional[LogFn] = None,
-) -> str:
-    q = f"{base_url}/turnstile?url={quote(siteurl, safe='')}&sitekey={quote(sitekey, safe='')}"
-    data = _http_json("GET", q, timeout=30.0)
-    task_id = str(data.get("taskId") or data.get("task_id") or "").strip()
-    if not task_id:
-        raise RuntimeError(f"solver create task failed: {data}")
-    _lg(log, f"[turnstile-solver] taskId={task_id[:16]}…")
-    deadline = time.time() + max(15.0, float(max_wait or 90))
-    time.sleep(3.0)
-    while time.time() < deadline:
-        try:
-            r = _http_json("GET", f"{base_url}/result?id={quote(task_id, safe='')}", timeout=15.0)
-            sol = r.get("solution") if isinstance(r.get("solution"), dict) else {}
-            tok = str((sol or {}).get("token") or r.get("token") or "").strip()
-            if tok and tok != "CAPTCHA_FAIL" and len(tok) >= 80:
-                _lg(log, f"[turnstile-solver] token len={len(tok)}")
-                return tok
-            if tok == "CAPTCHA_FAIL":
-                _lg(log, "[turnstile-solver] CAPTCHA_FAIL")
-                return ""
-        except Exception as e:
-            _lg(log, f"[turnstile-solver] poll: {e}")
-        time.sleep(2.0)
-    _lg(log, "[turnstile-solver] timeout")
-    return ""
-
-
-def _solve_yescaptcha(
-    siteurl: str,
-    sitekey: str,
-    *,
-    key: str,
-    max_wait: float = 120.0,
-    log: Optional[LogFn] = None,
-) -> str:
-    data = _http_json(
-        "POST",
-        f"{_YESCAPTCHA_API}/createTask",
-        body={
-            "clientKey": key,
-            "task": {
-                "type": "TurnstileTaskProxyless",
-                "websiteURL": siteurl,
-                "websiteKey": sitekey,
-            },
-        },
-        timeout=30.0,
-    )
-    if int(data.get("errorId") or 0) != 0:
-        raise RuntimeError(data.get("errorDescription") or str(data))
+    client_key: str,
+    proxy: str,
+    action: str,
+    cdata: str,
+    max_wait: float,
+    log: Optional[LogFn],
+) -> SolveResult:
+    started = time.monotonic()
+    try:
+        data = _http_json(
+            "POST",
+            f"{base_url}/createTask",
+            body={"clientKey": client_key, "task": _task_payload(siteurl, sitekey, proxy=proxy, action=action, cdata=cdata)},
+            timeout=30.0,
+            api_key=client_key if provider == "local" else "",
+        )
+    except Exception as exc:
+        return SolveResult(
+            "failed",
+            provider,
+            error_code="ERROR_CREATE_TASK",
+            error=str(exc),
+            elapsed_ms=int((time.monotonic() - started) * 1_000),
+        )
+    if int(data.get("errorId") or 0):
+        return SolveResult(
+            "failed",
+            provider,
+            error_code=str(data.get("errorCode") or "ERROR_CREATE_TASK"),
+            error=str(data.get("errorDescription") or "createTask failed"),
+        )
     task_id = str(data.get("taskId") or "").strip()
     if not task_id:
-        raise RuntimeError(f"YesCaptcha no taskId: {data}")
-    _lg(log, f"[yescaptcha] taskId={task_id[:16]}…")
-    deadline = time.time() + max(20.0, float(max_wait or 120))
-    time.sleep(5.0)
-    while time.time() < deadline:
-        r = _http_json(
-            "POST",
-            f"{_YESCAPTCHA_API}/getTaskResult",
-            body={"clientKey": key, "taskId": task_id},
-            timeout=20.0,
-        )
-        if int(r.get("errorId") or 0) != 0:
-            _lg(log, f"[yescaptcha] error: {r.get('errorDescription')}")
-            return ""
-        if r.get("status") == "ready":
-            tok = str((r.get("solution") or {}).get("token") or "").strip()
-            if len(tok) >= 80:
-                _lg(log, f"[yescaptcha] token len={len(tok)}")
-                return tok
-            return ""
-        time.sleep(2.0)
-    _lg(log, "[yescaptcha] timeout")
-    return ""
+        return SolveResult("failed", provider, error_code="ERROR_NO_TASK_ID", error="createTask returned no taskId")
+    _log(log, f"[{provider}] taskId={task_id[:12]}…")
+    return _poll_provider(
+        base_url,
+        task_id,
+        client_key=client_key,
+        provider=provider,
+        max_wait=max_wait,
+        log=log,
+    )
+
+
+def solve_turnstile_result(
+    siteurl: str = _DEFAULT_SITE_URL,
+    sitekey: str = "",
+    *,
+    prefer: str = "auto",
+    max_wait: float = 90.0,
+    proxy: str = "",
+    action: str = "",
+    cdata: str = "",
+    log: Optional[LogFn] = None,
+) -> SolveResult:
+    config = _load_cfg()
+    url = (siteurl or _DEFAULT_SITE_URL).strip()
+    key = (sitekey or sitekey_default(config)).strip()
+    preferred = (prefer or "auto").strip().lower()
+    providers: list[Literal["local", "yescaptcha"]] = []
+    if preferred == "local":
+        providers = ["local"]
+    elif preferred == "yescaptcha":
+        providers = ["yescaptcha"]
+    else:
+        if solver_enabled(config):
+            providers.append("local")
+        if yescaptcha_key(config):
+            providers.append("yescaptcha")
+    if not providers:
+        return SolveResult("failed", "none", error_code="ERROR_NOT_CONFIGURED", error="no solver provider is enabled")
+
+    last = SolveResult("failed", "none", error_code="ERROR_NOT_CONFIGURED", error="no provider attempted")
+    for provider in providers:
+        client_key = solver_key(config) if provider == "local" else yescaptcha_key(config)
+        if provider == "yescaptcha" and not client_key:
+            last = SolveResult("failed", provider, error_code="ERROR_NO_CLIENT_KEY", error="YesCaptcha key is empty")
+            continue
+        try:
+            last = _solve_provider(
+                provider,
+                url,
+                key,
+                base_url=solver_url(config) if provider == "local" else _YESCAPTCHA_API,
+                client_key=client_key,
+                proxy=proxy,
+                action=action,
+                cdata=cdata,
+                max_wait=max_wait,
+                log=log,
+            )
+        except Exception as exc:
+            last = SolveResult(
+                "failed",
+                provider,
+                error_code="ERROR_CLIENT",
+                error=str(exc),
+            )
+        if last.solved:
+            _log(log, f"[{provider}] token received len={len(last.token)}")
+            return last
+        _log(log, f"[{provider}] failed {last.error_code}: {last.error}")
+    return last
 
 
 def solve_turnstile(
@@ -240,55 +376,20 @@ def solve_turnstile(
     *,
     prefer: str = "auto",
     max_wait: float = 90.0,
+    proxy: str = "",
+    action: str = "",
+    cdata: str = "",
     log: Optional[LogFn] = None,
 ) -> str:
-    """解 Turnstile，返回 token 或空串。
-
-    prefer: auto | local | yescaptcha
-      auto: 若 solver enabled 先本地；否则/失败再 YesCaptcha（有 key）
-    """
-    cfg = _load_cfg()
-    sk = (sitekey or sitekey_default(cfg)).strip()
-    url = (siteurl or _DEFAULT_SITE_URL).strip()
-    pref = (prefer or "auto").strip().lower()
-    local_on = solver_enabled(cfg)
-    yc = yescaptcha_key(cfg)
-    base = solver_url(cfg)
-
-    errors: list[str] = []
-
-    def try_local() -> str:
-        if not local_on and pref != "local":
-            return ""
-        try:
-            return _solve_local(url, sk, base_url=base, max_wait=max_wait, log=log)
-        except Exception as e:
-            errors.append(f"local:{e}")
-            _lg(log, f"[turnstile-solver] local fail: {e}")
-            return ""
-
-    def try_yc() -> str:
-        if not yc:
-            return ""
-        try:
-            return _solve_yescaptcha(url, sk, key=yc, max_wait=max_wait, log=log)
-        except Exception as e:
-            errors.append(f"yc:{e}")
-            _lg(log, f"[yescaptcha] fail: {e}")
-            return ""
-
-    if pref == "yescaptcha":
-        return try_yc()
-    if pref == "local":
-        return try_local()
-
-    # auto
-    tok = try_local()
-    if tok and len(tok) >= 80:
-        return tok
-    tok = try_yc()
-    if tok and len(tok) >= 80:
-        return tok
-    if errors:
-        _lg(log, f"[turnstile-solver] all failed: {'; '.join(errors)}")
-    return ""
+    """Backward-compatible token-only wrapper."""
+    result = solve_turnstile_result(
+        siteurl,
+        sitekey,
+        prefer=prefer,
+        max_wait=max_wait,
+        proxy=proxy,
+        action=action,
+        cdata=cdata,
+        log=log,
+    )
+    return result.token if result.solved else ""

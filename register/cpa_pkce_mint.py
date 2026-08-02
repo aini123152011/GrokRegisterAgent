@@ -22,10 +22,9 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 import cpa_grpcweb as grpcweb
+from cpa_schema import CLIENT_ID, ISSUER
 
-# Keep in sync with CLIProxyAPI / our cpa_schema
-CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-ISSUER = "https://auth.x.ai"
+# Keep in sync with CLIProxyAPI / cpa_schema.
 SCOPE = "openid profile email offline_access grok-cli:access api:access"
 AUTHORIZATION_ENDPOINT = f"{ISSUER}/oauth2/authorize"
 TOKEN_ENDPOINT = f"{ISSUER}/oauth2/token"

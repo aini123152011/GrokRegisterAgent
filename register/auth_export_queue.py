@@ -25,6 +25,7 @@ import queue
 import random
 import threading
 import time
+import uuid
 from pathlib import Path  # used by NSFW/sub2api helpers
 from typing import Any, Callable, Optional
 
@@ -46,6 +47,60 @@ _enqueue_block_sec = 120.0
 # 常见 key: mint_queue_full / mint_denied_castle / mint_skipped_bot /
 #           mint_oauth_fail / mint_fail / sso_g2_fail / empty_sso / worker_error
 _fail_by_status: dict[str, int] = {}
+
+
+def durable_queue_enabled() -> bool:
+    """Use the container-level queue daemon instead of runner-owned threads."""
+    return _truthy(os.environ.get("AUTH_QUEUE_DAEMON"))
+
+
+def durable_queue_root() -> Path:
+    configured = str(os.environ.get("AUTH_QUEUE_DIR") or "").strip()
+    if configured:
+        return Path(configured)
+    if Path("/data").is_dir():
+        return Path("/data/auth-queue")
+    return Path(__file__).resolve().parent / "data" / "auth-queue"
+
+
+def _ensure_durable_dirs() -> dict[str, Path]:
+    root = durable_queue_root()
+    out = {name: root / name for name in ("pending", "running", "done", "failed", "tmp")}
+    for path in out.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _persist_durable_job(job: dict[str, Any]) -> tuple[str, Path]:
+    """Atomically persist a job before acknowledging it to the registrar."""
+    dirs = _ensure_durable_dirs()
+    job_id = str(job.get("job_id") or uuid.uuid4())
+    run_at_ms = int(float(job.get("run_at") or time.time()) * 1000)
+    name = f"{run_at_ms:013d}_{job_id}.json"
+    payload = dict(job)
+    payload["job_id"] = job_id
+    payload.setdefault("attempt", 0)
+    payload.setdefault("created_at", time.time())
+    tmp = dirs["tmp"] / f".{name}.{os.getpid()}.tmp"
+    final = dirs["pending"] / name
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, final)
+    return job_id, final
+
+
+def durable_queue_stats() -> dict[str, int]:
+    try:
+        dirs = _ensure_durable_dirs()
+        return {
+            name: sum(1 for _ in dirs[name].glob("*.json"))
+            for name in ("pending", "running", "done", "failed")
+        }
+    except Exception:
+        return {"pending": 0, "running": 0, "done": 0, "failed": 0}
 
 
 def _noop(_: str) -> None:
@@ -81,7 +136,12 @@ def classify_mint_status(
         st = str(result.get("status") or "").strip()
         if st and st not in ("unknown", "mint_fail"):
             # 尊重上游已分类 status（预算/背压/跳过等）
-            if st.startswith("mint_") or st in ("empty_sso", "sso_g2_fail", "worker_error"):
+            if (
+                st.startswith("mint_")
+                or st.startswith("tls_")
+                or st.startswith("network_")
+                or st in ("oauth_preflight_failed", "empty_sso", "sso_g2_fail", "worker_error")
+            ):
                 return st
     if result and result.get("skipped_bot_flag"):
         return "mint_skipped_bot"
@@ -320,8 +380,15 @@ def queue_stats() -> dict[str, Any]:
         k: (round(100.0 * int(fail_by.get(k) or 0) / focus_total, 1) if focus_total else 0.0)
         for k in focus_keys
     }
+    durable = durable_queue_stats() if durable_queue_enabled() else {
+        "pending": 0,
+        "running": 0,
+        "done": 0,
+        "failed": 0,
+    }
+    durable_active = int(durable.get("pending") or 0) + int(durable.get("running") or 0)
     stats: dict[str, Any] = {
-        "pending": max(0, _pending),
+        "pending": max(0, _pending, durable_active),
         "queue_size": qsize,
         "done_ok": _done_ok,
         "done_fail": _done_fail,
@@ -329,6 +396,11 @@ def queue_stats() -> dict[str, Any]:
         "queue_max": _queue_max,
         "fail_by_status": fail_by,
         "fail_status_ratio_pct": ratio_pct,
+        "durable": durable_queue_enabled(),
+        "durable_pending": int(durable.get("pending") or 0),
+        "durable_running": int(durable.get("running") or 0),
+        "durable_done": int(durable.get("done") or 0),
+        "durable_failed": int(durable.get("failed") or 0),
         **mint_extra,
     }
     try:
@@ -731,6 +803,18 @@ def _run_mint_and_auth_push(
 ) -> dict[str, Any]:
     try:
         from auth_service import sso_to_cpa_auth
+        from oauth_preflight import oauth_tls_preflight
+
+        preflight = oauth_tls_preflight(proxy, log=log)
+        if not preflight.get("ok"):
+            status = str(preflight.get("status") or "oauth_preflight_failed")
+            return {
+                "ok": False,
+                "status": status,
+                "error": str(preflight.get("error") or status),
+                "oauth_preflight": preflight,
+                "retryable": status.startswith("network_") or status.startswith("tls_"),
+            }
 
         # skip_remote=False 时 mint 成功会按 config 推 CPA；
         # 若未开自动推 CPA，则 skip_remote=True 只写本地
@@ -975,7 +1059,7 @@ def _run_mint_and_auth_push(
         return {"ok": False, "error": str(e), "status": status}
 
 
-def _process_job(job: dict[str, Any]) -> None:
+def _process_job(job: dict[str, Any]) -> dict[str, Any]:
     global _pending, _done_ok, _done_fail
     delay = int(job.get("delay_sec") or 0)
     email = str(job.get("email") or "")
@@ -991,6 +1075,7 @@ def _process_job(job: dict[str, Any]) -> None:
     do_cpa = bool(flags.get("auth_cpa"))
     wid = threading.current_thread().name
     fail_statuses: list[str] = []
+    last_error = ""
 
     run_at = float(job.get("run_at") or 0)
     if run_at > 0:
@@ -1016,14 +1101,14 @@ def _process_job(job: dict[str, Any]) -> None:
         )
         _done_fail += 1
         _bump_fail_status("empty_sso")
-        return
+        return {"ok": False, "status": "empty_sso", "error": "empty sso"}
 
     if not (do_sso_g2 or do_auth):
         _log(
             f"[auth-queue][{wid}] 跳过 email={email or '-'}：未开 SSO 推送且未开自动转换 Auth"
         )
         _done_ok += 1
-        return
+        return {"ok": True, "status": "skipped"}
 
     _log(
         f"[auth-queue][{wid}] ▶ 授权流水线开始 email={email or '-'} "
@@ -1111,6 +1196,7 @@ def _process_job(job: dict[str, Any]) -> None:
             )
             if not mint_r.get("ok"):
                 step_ok = False
+                last_error = str(mint_r.get("error") or "")
                 status = str(
                     mint_r.get("status")
                     or classify_mint_status(mint_r)
@@ -1124,6 +1210,7 @@ def _process_job(job: dict[str, Any]) -> None:
     if step_ok:
         _done_ok += 1
         _log(f"[auth-queue][{wid}] ✔ 流水线完成 email={email or '-'}")
+        return {"ok": True, "status": "ok", "handed_to_mint_pool": bool(do_auth and handed)}
     else:
         _done_fail += 1
         # 去重保序：同一 job 可能 sso_g2 + mint 双失败
@@ -1146,6 +1233,16 @@ def _process_job(job: dict[str, Any]) -> None:
             f"[auth-queue][{wid}] ✘ 流水线部分失败 email={email or '-'} "
             f"status={status_label}"
         )
+        return {
+            "ok": False,
+            "status": status_label,
+            "statuses": ordered,
+            "error": last_error or status_label,
+            "retryable": any(
+                s.startswith("tls_") or s.startswith("network_") or s == "worker_error"
+                for s in ordered
+            ),
+        }
 
 
 def _worker_loop() -> None:
@@ -1344,8 +1441,6 @@ def enqueue_sso_to_auth(
             "flags": flags,
         }
 
-    ensure_worker()
-    assert _q is not None
     job = {
         "sso": sso,
         "email": (email or "").strip(),
@@ -1359,6 +1454,44 @@ def enqueue_sso_to_auth(
         "run_at": run_at,
         "enqueued_at": time.time(),
     }
+
+    if durable_queue_enabled():
+        try:
+            job_id, _path = _persist_durable_job(job)
+        except Exception as exc:
+            _log(
+                f"[auth-queue] ✘ 持久化入队失败 email={email or '-'} err={exc}",
+                log,
+            )
+            return {
+                "queued": False,
+                "error": f"durable queue write failed: {exc}",
+                "durable": True,
+                "flags": flags,
+            }
+        stats = durable_queue_stats()
+        pending = int(stats.get("pending") or 0) + int(stats.get("running") or 0)
+        _log(
+            f"[auth-queue] 已持久化入队 job={job_id[:12]} email={email or '-'} "
+            f"delay={delay}s mode={mode} pending≈{pending}",
+            log,
+        )
+        return {
+            "queued": True,
+            "durable": True,
+            "job_id": job_id,
+            "delay_sec": delay,
+            "run_at": run_at,
+            "pending": pending,
+            "mint_mode": mode,
+            "flags": flags,
+            "workers": 0,
+            "queue_max": 0,
+            "stats": queue_stats(),
+        }
+
+    ensure_worker()
+    assert _q is not None
     try:
         _q.put(job, timeout=_enqueue_block_sec)
     except queue.Full:

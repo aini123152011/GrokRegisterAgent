@@ -24,9 +24,11 @@ import shutil
 import tempfile
 import datetime
 import logging
+import re
 import time
 import secrets
 import platform
+import urllib.parse
 from pathlib import Path
 
 from email_register import get_email_and_token, get_oai_code
@@ -2388,7 +2390,8 @@ return n > 0;
                 )
                 if vr.get("ok"):
                     print(
-                        f"[*] 协议 VerifyEmail 成功: {email} code={str(code).replace('-','')}",
+                        f"[*] 协议 VerifyEmail 成功: {email} "
+                        f"code=<redacted:{len(str(code).replace('-', ''))}>",
                         flush=True,
                     )
                     return code
@@ -2607,7 +2610,7 @@ return 'clicked';
                 clicked = 'disconnected'
 
             if clicked == 'clicked':
-                print(f"[*] 已填写验证码并点击确认邮箱: {code}")
+                print(f"[*] 已填写验证码并点击确认邮箱: <redacted:{len(code)}>")
                 time.sleep(2)
                 refresh_active_page()
                 if has_profile_form():
@@ -2617,7 +2620,10 @@ return 'clicked';
             if clicked == 'no-button':
                 current_url = page.url
                 if 'sign-up' in current_url or 'signup' in current_url:
-                    print(f"[*] 已填写验证码，页面已自动跳转到下一步: {current_url}")
+                    print(
+                        "[*] 已填写验证码，页面已自动跳转到下一步: "
+                        f"{_safe_url_for_log(current_url)}"
+                    )
                     return code
 
             if clicked == 'disconnected':
@@ -2646,7 +2652,7 @@ const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible).
     testid: node.getAttribute('data-testid') || '',
     autocomplete: node.autocomplete || '',
     maxLength: Number(node.maxLength || 0),
-    value: String(node.value || ''),
+    valueLength: String(node.value || '').length,
 }));
 
 const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible).map((node) => ({
@@ -2655,7 +2661,7 @@ const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible
     ariaDisabled: node.getAttribute('aria-disabled') || '',
 }));
 
-return { url: location.href, inputs, buttons };
+return { url: location.origin + location.pathname, inputs, buttons };
         """
     )
     print(f"[Debug] 验证码页 DOM 摘要: {debug_snapshot}")
@@ -2668,7 +2674,8 @@ return { url: location.href, inputs, buttons };
         )
         if vr.get("ok"):
             print(
-                f"[*] 协议 VerifyEmail 成功（无 UI OTP）: {email} code={code}",
+                f"[*] 协议 VerifyEmail 成功（无 UI OTP）: {email} "
+                f"code=<redacted:{len(code)}>",
                 flush=True,
             )
             # 标记：后续 fill_profile 若无表单，run_single 应走 hybrid 收尾
@@ -2828,24 +2835,35 @@ for (const sel of hostSel) {
   } catch (e) {}
 }
 
-const failure = frames.some((f) =>
+const hasApi = typeof turnstile !== 'undefined';
+const markedFrames = frames.filter((f) =>
+  /challenges\\.cloudflare\\.com|turnstile|widget containing/i.test(
+    String(f.src || '') + ' ' + String(f.title || '')
+  )
+);
+const failure = markedFrames.some((f) =>
   /\\/failure/i.test(f.src) || /feedback report/i.test(f.title) || /failed/i.test(f.title)
 );
-const challenge = frames.find((f) =>
+const challenge = markedFrames.find((f) =>
   /challenges\\.cloudflare\\.com/i.test(f.src) && !/\\/failure/i.test(f.src) && f.w >= 20 && f.h >= 20
-) || frames.find((f) =>
+) || markedFrames.find((f) =>
   /turnstile|widget containing/i.test((f.src || '') + ' ' + (f.title || '')) && f.w >= 20 && f.h >= 20
 ) || null;
-const sized = frames.find((f) => f.w >= 240 && f.w <= 400 && f.h >= 50 && f.h <= 90) || null;
+const sized = markedFrames.find((f) => f.w >= 240 && f.w <= 400 && f.h >= 50 && f.h <= 90) || null;
 const hostSized = hosts.find((h) => h.w >= 100 && h.h >= 40) || hosts.find((h) => h.w >= 20 && h.h >= 20) || null;
-const collapsedOnly = !challenge && !sized && frames.some((f) => f.w > 0 && f.w <= 5 && f.h > 0 && f.h <= 5);
+// Loading the Turnstile API alone does not prove that a widget is still
+// mounted.  Require a response input, a known host, or a marked iframe.
+const hasWidgetMarker = !!input || hosts.length > 0 || markedFrames.length > 0;
+const collapsedOnly = hasWidgetMarker && !challenge && !sized && frames.some(
+  (f) => f.w > 0 && f.w <= 5 && f.h > 0 && f.h <= 5
+);
 const tokenLen = input ? String(input.value || '').trim().length : 0;
 return {
   failure: !!failure,
   collapsedOnly: !!collapsedOnly,
   tokenLen,
   hasInput: !!input,
-  hasApi: typeof turnstile !== 'undefined',
+  hasApi,
   challenge,
   sized,
   hostSized,
@@ -3746,6 +3764,7 @@ def getTurnstileToken(timeout=50, log_callback=None, *, fast=False, auto_wait_ca
                 siteurl="https://accounts.x.ai/sign-up",
                 sitekey="",
                 max_wait=90,
+                proxy=str(_browser_proxy or "").strip(),
                 log=lambda m: print(m),
             )
             if ext and len(str(ext)) >= 80:
@@ -4198,7 +4217,10 @@ return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
 
         if clicked:
             tag = "plan-b" if plan_b else "*"
-            print(f"[{tag}] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
+            print(
+                f"[{tag}] 已填写注册资料并点击完成注册: "
+                f"{given_name} {family_name} / password=<redacted:{len(password)}>"
+            )
             # 给导航一点时间，避免立刻读 cookie 撞断开
             time.sleep(1.2)
             return {
@@ -4353,6 +4375,35 @@ def wait_for_sso_cookie(timeout=30, prefer_domain: str = "grok.com"):
     raise Exception(f"注册完成后未获取到 sso cookie，当前已见 cookie: {sorted(last_seen_names)}")
 
 
+def _safe_url_for_log(value: str) -> str:
+    """Keep navigation diagnostics without leaking callback codes or set-cookie JWTs."""
+    raw = str(value or "")
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        sensitive = {
+            "q", "code", "state", "token", "access_token", "refresh_token",
+            "id_token", "sso", "ticket", "session", "credential",
+        }
+        pairs = []
+        for key, val in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            if key.lower() in sensitive:
+                pairs.append((key, f"<redacted:{len(val)}>"))
+            else:
+                pairs.append((key, val[:120]))
+        query = urllib.parse.urlencode(pairs)
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, query, "")
+        )[:500]
+    except Exception:
+        return re.sub(
+            r"(?i)([?&](?:q|code|state|token|sso|ticket)=)[^&#\s]+",
+            r"\1<redacted>",
+            raw,
+        )[:500]
+
+
 def wait_for_grok_com_landing(timeout: int = 90, *, skip_cf_retry: bool = False) -> bool:
     # 注册流（accounts.x.ai/sign-up?redirect=grok-com）完成后，浏览器会经过一段
     # SSO 重定向链，最终落到 grok.com 并把会话 cookie 写到 grok.com 域上。
@@ -4366,8 +4417,10 @@ def wait_for_grok_com_landing(timeout: int = 90, *, skip_cf_retry: bool = False)
     deadline = time.time() + timeout
     last_url = ""
     cf_retry = 0
-    # soft-nav：先静等重定向；仅当长时间仍停在 accounts 最终页才允许二次复用
-    soft_grace_until = time.time() + (22.0 if skip_cf_retry else 0.0)
+    recovery_opened: set[str] = set()
+    # Every submit gets a navigation grace period.  Previously Plan A retried
+    # immediately and treated transient callback/account pages as Turnstile.
+    soft_grace_until = time.time() + (22.0 if skip_cf_retry else 15.0)
     if skip_cf_retry:
         print(
             "[*] soft-nav 已提交：先静等重定向 ~22s，期间跳过最终页二次点提交",
@@ -4378,13 +4431,35 @@ def wait_for_grok_com_landing(timeout: int = 90, *, skip_cf_retry: bool = False)
             refresh_active_page()
             current_url = page.url or ""
             if current_url != last_url:
-                print(f"[*] 等待重定向到 grok.com，当前: {current_url}")
+                print(f"[*] 等待重定向到 grok.com，当前: {_safe_url_for_log(current_url)}")
                 last_url = current_url
+
+            cu = (current_url or "").lower()
+            # These are progress states, not CAPTCHA states.  Give the setter a
+            # short chance to write cookies, then open grok.com in an isolated
+            # tab so the login state can materialize.
+            recovery_kind = ""
+            if "auth.grokusercontent.com/set-cookie" in cu:
+                recovery_kind = "set-cookie"
+            elif "auth.x.ai/set-cookie" in cu:
+                recovery_kind = "auth-set-cookie"
+            elif "accounts.x.ai/account" in cu:
+                recovery_kind = "account"
+            if recovery_kind and recovery_kind not in recovery_opened:
+                recovery_opened.add(recovery_kind)
+                print(f"[*] 检测到 {recovery_kind} 登录进度页，等待 Cookie 后打开 grok.com…")
+                time.sleep(2.0)
+                try:
+                    if browser is not None:
+                        page = browser.new_tab("https://grok.com/")
+                        time.sleep(1.5)
+                        continue
+                except Exception as nav_e:
+                    print(f"[Warn] 登录进度页恢复失败: {nav_e}", flush=True)
 
             # mint browser 若误附着注册 Chromium，会把 URL 打到 oauth2/device / sign-in?redirect=oauth2
             # 绝不当 CF 去点「完成注册」；尝试新开 grok.com 标签恢复会话
             try:
-                cu = (current_url or "").lower()
                 hijack = (
                     "oauth2/authorize" in cu
                     or "oauth2/consent" in cu
@@ -4395,7 +4470,8 @@ def wait_for_grok_com_landing(timeout: int = 90, *, skip_cf_retry: bool = False)
                 )
                 if hijack:
                     print(
-                        f"[Warn] 检测到 mint/oauth 劫持注册页: {current_url[:120]} · 尝试恢复 grok.com",
+                        f"[Warn] 检测到 mint/oauth 劫持注册页: "
+                        f"{_safe_url_for_log(current_url)[:160]} · 尝试恢复 grok.com",
                         flush=True,
                     )
                     try:
@@ -4409,29 +4485,50 @@ def wait_for_grok_com_landing(timeout: int = 90, *, skip_cf_retry: bool = False)
             except Exception:
                 pass
 
-            # 最终页仍停在 accounts.x.ai 且出现 Turnstile / CF 挑战
+            # 最终页仍停在 accounts.x.ai 且存在真实 Turnstile 元素/状态。
+            # 正文里出现 turnstile 字样不再单独触发 Solver。
             stuck_cf = False
             try:
                 st = _turnstile_widget_state() if "accounts.x.ai" in current_url else {}
-                if st.get("failure") or st.get("collapsedOnly"):
-                    stuck_cf = True
-                if not stuck_cf and "accounts.x.ai" in current_url:
-                    body_cf = page.run_js(
+                exact_widget = False
+                if "accounts.x.ai/sign-up" in cu:
+                    exact_widget = page.run_js(
                         r"""
-const t = (document.body && (document.body.innerText || document.body.textContent) || '');
-return /checking your browser|just a moment|cf-browser-verification|turnstile|verify you are human/i.test(t)
-  || !!document.querySelector('iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]');
+return !!document.querySelector(
+  'iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"], '
+  + '[data-sitekey], .cf-turnstile, [data-testid*="turnstile" i]'
+);
 """
                     )
-                    stuck_cf = bool(body_cf)
+                explicit_widget = bool(
+                    st.get("hasInput")
+                    or st.get("challenge")
+                    or st.get("sized")
+                    or st.get("hostSized")
+                    or st.get("hosts")
+                    or exact_widget
+                )
+                actionable = bool(
+                    explicit_widget
+                    and (
+                        st.get("failure")
+                        or st.get("collapsedOnly")
+                        or st.get("challenge")
+                        or st.get("sized")
+                        or st.get("hostSized")
+                        or st.get("hasInput")
+                        or exact_widget
+                    )
+                )
+                stuck_cf = bool(actionable and "accounts.x.ai/sign-up" in cu)
             except Exception:
                 stuck_cf = False
             # soft-nav 静等窗口内禁止二次点提交；窗口过后若仍卡 accounts 才复用
-            allow_cf_retry = (not skip_cf_retry) or (time.time() >= soft_grace_until)
+            allow_cf_retry = (not skip_cf_retry) and (time.time() >= soft_grace_until)
             if (
                 stuck_cf
                 and allow_cf_retry
-                and cf_retry < 3
+                and cf_retry < 2
                 and time.time() + 12 < deadline
             ):
                 cf_retry += 1
@@ -4442,7 +4539,20 @@ return /checking your browser|just a moment|cf-browser-verification|turnstile|ve
                     pass
                 tok = getTurnstileToken(timeout=min(20, max(8, deadline - time.time() - 5)))
                 if tok:
-                    _inject_turnstile_token(tok)
+                    try:
+                        refresh_active_page()
+                    except Exception:
+                        pass
+                    post_solver_url = str(getattr(page, "url", "") or "")
+                    still_signup = "accounts.x.ai/sign-up" in post_solver_url.lower()
+                    injected = bool(still_signup and _inject_turnstile_token(tok))
+                    if not injected:
+                        print(
+                            "[*] 外部 token 返回时注册页已离开或 Turnstile 控件不存在，"
+                            "跳过注入与二次提交"
+                        )
+                        time.sleep(0.5)
+                        continue
                     print(f"[*] 最终页 Turnstile 二次复用完成 len={len(tok)}")
                     # 注入后必须再点「完成注册」，否则会一直停在 sign-up
                     try:
@@ -4502,7 +4612,7 @@ return false;
             pass
         time.sleep(1)
 
-    print(f"[Warn] 等待 grok.com 登录超时，最后 URL: {last_url}")
+    print(f"[Warn] 等待 grok.com 登录超时，最后 URL: {_safe_url_for_log(last_url)}")
     return False
 
 
@@ -5789,7 +5899,8 @@ def run_single_registration(
     else:
         # 注册完成后等浏览器跑完 SSO 重定向链落到 grok.com 并登录
         _nav_soft = bool(isinstance(profile, dict) and profile.get("nav_soft"))
-        if not wait_for_grok_com_landing(skip_cf_retry=_nav_soft):
+        landing_ok = wait_for_grok_com_landing(skip_cf_retry=_nav_soft)
+        if not landing_ok:
             print("[Warn] 未能落到 grok.com 登录态，sso 质量可能受影响")
 
         age_status = ensure_age_gate_completed(timeout=45)
@@ -5798,6 +5909,15 @@ def run_single_registration(
         password = str(profile.get("password", "") or "")
     if isinstance(profile, dict):
         profile = {**profile, "plan": plan_mode}
+
+    # Stable delivery grade: downstream consumers can distinguish a partial
+    # accounts.x.ai SSO from a product-ready Grok session.
+    if isinstance(profile, dict) and profile.get("hybrid_done"):
+        landing_ok = False
+    has_age = bool(age_status.get("submitted"))
+    delivery_grade = "ready" if landing_ok and has_age else "sso_partial"
+    if landing_ok and not has_age:
+        delivery_grade = "grok_session"
 
     # W3 · SSO 指纹账本去重（重复不算成功，不入队、不占目标）
     # hybrid 收尾已在 hybrid_register.claim_sso 登记：此处再 claim 会误报 duplicate
@@ -6026,21 +6146,24 @@ def run_single_registration(
         "age_gate": age_status,
         "auth": auth_status,
         "grok2api": grok2api_status,
+        "delivery_grade": delivery_grade,
+        "grok_landing_ok": bool(landing_ok),
         **profile,
     }
 
     if run_logger:
         run_logger.info(
-            "注册成功 | email=%s | password=%s | given=%s | family=%s | age_year=%s | age_ok=%s",
+            "注册成功 | email=%s | password=<redacted:%s> | given=%s | family=%s | age_year=%s | age_ok=%s | grade=%s",
             email,
-            profile.get("password", ""),
+            len(str(profile.get("password", "") or "")),
             profile.get("given_name", ""),
             profile.get("family_name", ""),
             age_status.get("birth_year"),
             age_status.get("submitted"),
+            delivery_grade,
         )
 
-    print(f"[*] 本轮注册完成，邮箱: {email}")
+    print(f"[*] 本轮注册完成，邮箱: {email} quality={delivery_grade}")
     return result
 
 
@@ -6623,6 +6746,14 @@ def main():
             st = queue_stats()
             pending = int(st.get("pending", 0) or 0)
             qsize = int(st.get("queue_size", 0) or 0)
+            if st.get("durable"):
+                print(
+                    f"[auth-queue] 注册结束 · 授权任务已由持久化 daemon 接管 "
+                    f"pending={st.get('durable_pending')} running={st.get('durable_running')}",
+                    flush=True,
+                )
+                pending = 0
+                qsize = 0
             if pending > 0 or qsize > 0:
                 wait_cap = 45.0
                 try:
