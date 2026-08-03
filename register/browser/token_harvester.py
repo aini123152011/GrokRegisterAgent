@@ -2653,7 +2653,12 @@ return frames.some(f=>{
                 time.sleep(1)
         # 外置 Solver / YesCaptcha 兜底（设置页开关或 env）
         try:
-            from turnstile_solver_client import solve_turnstile, solver_enabled, yescaptcha_key
+            from turnstile_solver_client import (
+                solve_turnstile,
+                solver_client_wait_timeout,
+                solver_enabled,
+                yescaptcha_key,
+            )
 
             if solver_enabled() or yescaptcha_key():
                 self._lg("[*] turnstile page miss → external solver…")
@@ -2669,10 +2674,18 @@ return frames.some(f=>{
                     current_proxy = str(getattr(_engine(), "_browser_proxy", "") or "").strip()
                 except Exception:
                     current_proxy = str(os.getenv("BROWSER_PROXY", "") or "").strip()
+                # Page interaction and external solving are separate phases.
+                # Plan C intentionally uses a short page timeout (22s), while
+                # the solver server may need its full 90s task deadline.
+                external_wait = solver_client_wait_timeout()
+                self._lg(
+                    f"[*] turnstile external wait={external_wait:.0f}s "
+                    "(independent of page timeout)"
+                )
                 ext = solve_turnstile(
                     siteurl="https://accounts.x.ai/sign-up",
                     sitekey=sk,
-                    max_wait=min(90, max(30, int(timeout or 50))),
+                    max_wait=external_wait,
                     proxy=current_proxy,
                     log=self._lg,
                 )

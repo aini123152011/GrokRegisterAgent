@@ -62,3 +62,18 @@ def test_probe_uses_health_endpoint(monkeypatch):
     result = client.probe_solver("http://solver")
     assert result["ok"] is True
     assert seen == [("GET", "http://solver/health")]
+
+
+def test_client_wait_never_expires_before_local_task(monkeypatch):
+    monkeypatch.setenv("TURNSTILE_TASK_TIMEOUT", "90")
+    monkeypatch.setenv("TURNSTILE_CLIENT_WAIT_TIMEOUT", "30")
+
+    assert client.solver_task_timeout({}) == 90
+    assert client.solver_client_wait_timeout({}) == 105
+
+
+def test_client_wait_honors_larger_explicit_deadline(monkeypatch):
+    monkeypatch.setenv("TURNSTILE_TASK_TIMEOUT", "120")
+    monkeypatch.setenv("TURNSTILE_CLIENT_WAIT_TIMEOUT", "160")
+
+    assert client.solver_client_wait_timeout({}) == 160

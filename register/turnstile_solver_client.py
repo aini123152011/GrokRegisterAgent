@@ -23,6 +23,8 @@ _DEFAULT_SITE_URL = "https://accounts.x.ai"
 _DEFAULT_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 _YESCAPTCHA_API = "https://api.yescaptcha.com"
 _TERMINAL_STATUSES = {"failed", "error", "expired", "cancelled"}
+_DEFAULT_TASK_TIMEOUT = 90.0
+_DEFAULT_CLIENT_GRACE = 15.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +96,38 @@ def solver_key(cfg: Optional[dict[str, Any]] = None) -> str:
 def yescaptcha_key(cfg: Optional[dict[str, Any]] = None) -> str:
     config = cfg if cfg is not None else _load_cfg()
     return os.getenv("YESCAPTCHA_KEY", "").strip() or str(config.get("yescaptcha_key") or "").strip()
+
+
+def _positive_timeout(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def solver_task_timeout(cfg: Optional[dict[str, Any]] = None) -> float:
+    """Return the local solver's server-side task deadline."""
+    config = cfg if cfg is not None else _load_cfg()
+    raw = os.getenv("TURNSTILE_TASK_TIMEOUT", "").strip()
+    if not raw:
+        raw = config.get("turnstile_task_timeout", _DEFAULT_TASK_TIMEOUT)
+    return min(300.0, max(10.0, _positive_timeout(raw, _DEFAULT_TASK_TIMEOUT)))
+
+
+def solver_client_wait_timeout(cfg: Optional[dict[str, Any]] = None) -> float:
+    """Return a client deadline that cannot expire before the local solver.
+
+    The browser/page timeout is deliberately not used here.  A local task may
+    legitimately consume its full server-side deadline, so the caller keeps a
+    small grace window for the final poll and network latency.
+    """
+    config = cfg if cfg is not None else _load_cfg()
+    minimum = solver_task_timeout(config) + _DEFAULT_CLIENT_GRACE
+    raw = os.getenv("TURNSTILE_CLIENT_WAIT_TIMEOUT", "").strip()
+    if not raw:
+        raw = config.get("turnstile_client_wait_timeout", minimum)
+    return min(330.0, max(minimum, _positive_timeout(raw, minimum)))
 
 
 def sitekey_default(cfg: Optional[dict[str, Any]] = None) -> str:

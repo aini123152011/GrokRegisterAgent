@@ -44,6 +44,9 @@ services:
       DISPLAY: ":99"
       TURNSTILE_SOLVER_ENABLED: "${TURNSTILE_SOLVER_ENABLED:-0}"
       TURNSTILE_SOLVER_URL: "${TURNSTILE_SOLVER_URL:-http://turnstile-solver:5072}"
+      # Keep the client deadline beyond the solver's hard task deadline.
+      TURNSTILE_TASK_TIMEOUT: "${TURNSTILE_TASK_TIMEOUT:-90}"
+      TURNSTILE_CLIENT_WAIT_TIMEOUT: "${TURNSTILE_CLIENT_WAIT_TIMEOUT:-105}"
       TURNSTILE_API_KEY: "${TURNSTILE_API_KEY:-}"
       YESCAPTCHA_KEY: "${YESCAPTCHA_KEY:-}"
     volumes:
