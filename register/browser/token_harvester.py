@@ -82,6 +82,7 @@ class BrowserTokenSession:
   window.__hybrid_castles = window.__hybrid_castles || [];
   window.__hybrid_castle = window.__hybrid_castle || '';
   window.__hybrid_net = window.__hybrid_net || [];
+  window.__hybrid_next_actions = window.__hybrid_next_actions || [];
   window.__hybrid_create_email_ok = false;
   window.__hybrid_create_email_status = 0;
   window.__hybrid_create_email_seen = false;
@@ -93,6 +94,41 @@ class BrowserTokenSession:
       window.__hybrid_castle = s;
       window.__hybrid_castles.push(s);
     } catch (e) {}
+  }
+
+  function pushNextAction(value) {
+    try {
+      let action = String(value || '').trim();
+      if (action.indexOf('$ACTION_ID_') === 0) action = action.slice(11);
+      if (!/^[A-Za-z0-9_-]{32,160}$/.test(action)) return '';
+      const list = window.__hybrid_next_actions || (window.__hybrid_next_actions = []);
+      if (!list.includes(action)) list.push(action);
+      window.__hybrid_next_action = action;
+      return action;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function readHeader(headers, wanted) {
+    try {
+      if (!headers) return '';
+      if (typeof headers.get === 'function') {
+        const value = headers.get(wanted) || headers.get(String(wanted).toLowerCase());
+        if (value) return String(value);
+      }
+      if (Array.isArray(headers)) {
+        for (const pair of headers) {
+          if (Array.isArray(pair) && String(pair[0] || '').toLowerCase() === wanted) {
+            return String(pair[1] || '');
+          }
+        }
+      }
+      for (const key of Object.keys(headers || {})) {
+        if (String(key).toLowerCase() === wanted) return String(headers[key] || '');
+      }
+    } catch (e) {}
+    return '';
   }
 
   function extractCastleFromText(s) {
@@ -215,10 +251,15 @@ class BrowserTokenSession:
   window.fetch = async function(input, init) {
     let url = '';
     let args = arguments;
+    let nextAction = '';
     try {
       url = (typeof input === 'string')
         ? input
         : (input && (input.url || (input.href || ''))) || '';
+      nextAction = pushNextAction(readHeader(
+        (init && init.headers) || (input && input.headers),
+        'next-action'
+      ));
       let body = (init && init.body != null)
         ? init.body
         : (typeof Request !== 'undefined' && input instanceof Request ? input : null);
@@ -245,8 +286,7 @@ class BrowserTokenSession:
         window.__hybrid_create_email_seen = true;
       }
       // CreateUser is usually same-origin sign-up Server Action (next-action header)
-      const na = (init && init.headers && (init.headers['next-action'] || init.headers['Next-Action'])) || '';
-      if (na || (String(url).includes('sign-up') && init && typeof init.body === 'string'
+      if (nextAction || (String(url).includes('sign-up') && init && typeof init.body === 'string'
           && init.body.indexOf('createUserAndSessionRequest') >= 0)) {
         window.__hybrid_create_user_status = resp.status || 0;
         window.__hybrid_create_user_seen = true;
@@ -1574,23 +1614,70 @@ return {
         try:
             action = page.run_js(
                 r"""
+function normalizeAction(value) {
+  let action = String(value || '').trim();
+  if (action.startsWith('$ACTION_ID_')) action = action.slice(11);
+  return /^[A-Za-z0-9_-]{32,160}$/.test(action) ? action : '';
+}
+function actionFromFormAction(fn) {
+  try {
+    if (!fn) return '';
+    let hit = normalizeAction(fn.$$id || fn.id || '');
+    if (hit) return hit;
+    if (typeof fn.$$FORM_ACTION === 'function') {
+      const encoded = fn.$$FORM_ACTION('solver');
+      hit = normalizeAction(encoded && encoded.name);
+      if (hit) return hit;
+      const data = encoded && encoded.data;
+      if (data && typeof data.entries === 'function') {
+        for (const pair of data.entries()) {
+          hit = normalizeAction(pair && pair[0]);
+          if (hit) return hit;
+          hit = normalizeAction(pair && pair[1]);
+          if (hit) return hit;
+        }
+      }
+    }
+  } catch (e) {}
+  return '';
+}
 function pickFromText(t) {
   if (!t) return '';
   // named CSR: createServerReference("hash", ..., "default"|createUser...)
-  let m = t.match(/createServerReference\)\("([a-f0-9]{40,})"[^)]{0,260},"([A-Za-z0-9_]+)"\)/);
+  let m = t.match(/createServerReference[^"']{0,32}["']([a-f0-9]{40,128})["']/i);
   if (m) return m[1];
   const keys = ['createUserAndSessionRequest', 'emailValidationCode', 'createUserAndSession'];
   for (const key of keys) {
     const idx = t.indexOf(key);
     if (idx < 0) continue;
     const slice = t.slice(Math.max(0, idx - 500), idx + 500);
-    m = slice.match(/createServerReference\)\("([a-f0-9]{40,})"/);
+    m = slice.match(/createServerReference[^"']{0,32}["']([a-f0-9]{40,128})["']/i);
     if (m) return m[1];
     m = slice.match(/["']([a-f0-9]{40,64})["']/);
     if (m) return m[1];
   }
   m = t.match(/next-action["'\s:=]+([a-f0-9]{40,})/i);
   return m ? m[1] : '';
+}
+const captured = [window.__hybrid_next_action]
+  .concat(window.__hybrid_next_actions || [])
+  .map(normalizeAction).filter(Boolean);
+if (captured.length) return captured[captured.length - 1];
+for (const input of Array.from(document.querySelectorAll('input[name],button[name]'))) {
+  let hit = normalizeAction(input.name || '');
+  if (hit) return hit;
+  hit = normalizeAction(input.value || '');
+  if (hit) return hit;
+}
+for (const form of Array.from(document.forms || [])) {
+  for (const key of Object.keys(form)) {
+    if (!key.startsWith('__reactProps$') && !key.startsWith('__reactEventHandlers$')) continue;
+    const props = form[key] || {};
+    for (const candidate of [props.action, props.formAction, props.onSubmit]) {
+      const hit = actionFromFormAction(candidate);
+      if (hit) return hit;
+    }
+  }
 }
 const html = document.documentElement.innerHTML || '';
 let hit = pickFromText(html);
@@ -1625,9 +1712,9 @@ return (async () => {
       const url = c.startsWith('http') ? c : (location.origin + c);
       const t = await (await fetch(url, {credentials: 'same-origin'})).text();
       if (!keys.some(k => t.includes(k))) continue;
-      let m = t.match(/createServerReference\)\("([a-f0-9]{40,})"[^)]{0,260},"([A-Za-z0-9_]+)"\)/);
+      let m = t.match(/createServerReference[^"']{0,32}["']([a-f0-9]{40,128})["']/i);
       if (m) return m[1];
-      m = t.match(/createServerReference\)\("([a-f0-9]{40,})"/);
+      m = t.match(/createServerReference[^"']{0,32}["']([a-f0-9]{40,128})["']/i);
       if (m) return m[1];
     } catch (e) {}
   }

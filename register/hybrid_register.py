@@ -607,6 +607,20 @@ return {nC, nV, clen: castle.length, conv: conv.slice(0,8)};
             except Exception as pe0:
                 log(f"[hybrid] pre-profile castle/conversion inject skip: {pe0}")
 
+            # Resolve the current deployment's Server Action before clicking.
+            # A successful native submit may navigate/replace the form, making
+            # its React action metadata unavailable to the fallback path.
+            if not action:
+                try:
+                    action = str(browser.scrape_next_action() or "").strip()
+                except Exception as ae:
+                    log(f"[hybrid] pre-profile next-action scrape: {ae}")
+                    action = ""
+            log(
+                f"[hybrid] pre-profile next-action="
+                f"{(action[:20] + '…') if action else 'missing'}"
+            )
+
             # short human dwell before CreateUser / profile submit
             try:
                 time.sleep(0.6 + secrets.randbelow(90) / 100.0)
@@ -622,7 +636,10 @@ return {nC, nV, clen: castle.length, conv: conv.slice(0,8)};
                             given_name=given,
                             family_name=family,
                             password=prof_password,
-                            timeout=55.0,
+                            # If the fallback action is already known, 28s is
+                            # ample evidence that native React submit produced
+                            # no SSO; preserve token/castle freshness for SA.
+                            timeout=28.0 if action else 55.0,
                         )
                         or ""
                     )
