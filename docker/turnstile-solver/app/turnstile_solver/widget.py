@@ -11,6 +11,7 @@ from .models import SolveOutcome, TaskSpec, TaskState
 
 TOKEN_SELECTOR = 'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
 CF_FRAME_PREFIX = "https://challenges.cloudflare.com/"
+TURNSTILE_API_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
 StateCallback = Callable[[TaskState], Awaitable[None]]
 
 
@@ -83,9 +84,7 @@ class WidgetSolver:
                     "() => Boolean(window.turnstile && typeof window.turnstile.render === 'function')"
                 )
                 if not has_api:
-                    await page.add_script_tag(
-                        url="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
-                    )
+                    await self._load_api(page)
                 await page.wait_for_function(
                     "() => window.turnstile && typeof window.turnstile.render === 'function'",
                     timeout=15_000,
@@ -134,6 +133,86 @@ class WidgetSolver:
                 if attempt < 3:
                     await page.wait_for_timeout(750)
         raise WidgetError(f"failed to render Turnstile widget after 3 attempts: {'; '.join(errors)}")
+
+    @staticmethod
+    async def _load_api(page: Any) -> None:
+        """Load the widget API without Playwright's CSP-sensitive helper.
+
+        Camoufox/Firefox can reject ``add_script_tag`` when a page emits a
+        Content-Security-Policy-Report-Only violation, even though the browser
+        still permits the resource.  Appending a normal DOM script preserves
+        the page's native loading behavior and gives us explicit load/error
+        evidence.  The Playwright helper remains a compatibility fallback for
+        older runtimes and test doubles.
+        """
+        dom_error = ""
+        try:
+            result = await page.evaluate(
+                """
+                (url) => new Promise((resolve) => {
+                  const ready = () => Boolean(
+                    window.turnstile && typeof window.turnstile.render === 'function'
+                  );
+                  if (ready()) {
+                    resolve({ok: true, via: 'existing'});
+                    return;
+                  }
+
+                  const previous = document.querySelector(
+                    'script[data-solver-turnstile-api="1"]'
+                  );
+                  if (previous) previous.remove();
+
+                  const script = document.createElement('script');
+                  script.src = String(url || '');
+                  script.async = true;
+                  script.defer = true;
+                  script.dataset.solverTurnstileApi = '1';
+
+                  let settled = false;
+                  const finish = (ok, error) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    resolve({ok: Boolean(ok), error: String(error || ''), via: 'dom-script'});
+                  };
+                  const timer = setTimeout(
+                    () => finish(ready(), ready() ? '' : 'script-load-timeout'),
+                    15000
+                  );
+                  script.onload = () => finish(true, '');
+                  script.onerror = () => finish(false, 'script-load-error');
+                  (document.head || document.documentElement).appendChild(script);
+                })
+                """,
+                TURNSTILE_API_URL,
+            )
+            if isinstance(result, dict) and result.get("ok"):
+                return
+            if isinstance(result, str) and result:
+                return
+            if isinstance(result, dict):
+                dom_error = str(result.get("error") or "DOM script loader failed")
+            else:
+                dom_error = "DOM script loader returned no success evidence"
+        except Exception as exc:
+            dom_error = str(exc)
+
+        try:
+            await page.add_script_tag(url=TURNSTILE_API_URL)
+        except Exception as exc:
+            # A Report-Only warning may reject add_script_tag after the script
+            # has already started loading.  Accept it only if the API appears.
+            try:
+                await page.wait_for_function(
+                    "() => window.turnstile && typeof window.turnstile.render === 'function'",
+                    timeout=3_000,
+                )
+                return
+            except Exception:
+                raise WidgetError(
+                    f"Turnstile API load failed: dom={dom_error}; fallback={exc}"
+                ) from exc
 
     async def _poll_token(self, page: Any, timeout_ms: int) -> tuple[str, str]:
         deadline = time.monotonic() + timeout_ms / 1_000

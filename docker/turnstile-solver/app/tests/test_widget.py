@@ -45,11 +45,11 @@ class FakePage:
         self.rendered = False
 
     async def evaluate(self, expression, _argument=None):
-        if "window.turnstile.render" in expression:
+        if "Boolean(window.turnstile" in expression:
+            return True
+        if "const old = document.getElementById" in expression:
             self.rendered = True
             return {"ok": True, "widgetId": "widget-id", "error": ""}
-        if "typeof window.turnstile" in expression:
-            return True
         if "document.querySelectorAll" in expression:
             return {"token": self.token, "error": ""}
         return None
@@ -92,5 +92,40 @@ def test_hidden_or_tiny_frame_is_not_reported_as_clicked():
         page = FakePage(FakeFrame(FakeElement(visible=True, width=1)))
         assert await WidgetSolver._click_visible_frame(page) is False
         assert page.token == ""
+
+    asyncio.run(scenario())
+
+
+def test_dom_script_loader_avoids_csp_sensitive_add_script_tag():
+    class CspPage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.api_ready = False
+            self.add_script_tag_calls = 0
+
+        async def evaluate(self, expression, _argument=None):
+            if "Boolean(window.turnstile" in expression:
+                return self.api_ready
+            if "data-solver-turnstile-api" in expression:
+                self.api_ready = True
+                return {"ok": True, "via": "dom-script", "error": ""}
+            if "const old = document.getElementById" in expression:
+                self.rendered = True
+                return {"ok": True, "widgetId": "widget-id", "error": ""}
+            return await super().evaluate(expression, _argument)
+
+        async def add_script_tag(self, **_kwargs):
+            self.add_script_tag_calls += 1
+            raise RuntimeError("CSP report-only warning")
+
+    async def scenario():
+        page = CspPage()
+        await WidgetSolver(SolverConfig())._render(
+            page,
+            TaskSpec("https://example.com", "site-key"),
+        )
+        assert page.api_ready is True
+        assert page.rendered is True
+        assert page.add_script_tag_calls == 0
 
     asyncio.run(scenario())
